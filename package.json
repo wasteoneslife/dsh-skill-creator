@@ -1,0 +1,52 @@
+{
+  "name": "@cloudplugin/dsh-skill-creator",
+  "version": "0.0.1",
+  "description": "DeepSeek Harness plugin (bundle): visually create spec-compliant skills — Huawei Cloud mode per 《华为云基础云服务Skills和仓库管理规范》 / generic mode per agentskills.io",
+  "license": "MIT",
+  "icon": "./icon.svg",
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "src/**",
+    "!src/core/dsh-install.mjs",
+    "bin/**",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/**",
+    "assets/**",
+    "README.md",
+    "LICENSE"
+  ],
+  "bin": {
+    "dsh-skill-create": "bin/dsh-skill-create.mjs",
+    "dsh-skill-validate": "bin/dsh-skill-validate.mjs"
+  },
+  "exports": {
+    ".": "./src/core/plugin.mjs",
+    "./client": "./src/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node --test",
+    "creator:status": "node bin/dsh-skill-create.mjs --status",
+    "creator:refresh": "node bin/dsh-skill-create.mjs --refresh --status"
+  }
+}

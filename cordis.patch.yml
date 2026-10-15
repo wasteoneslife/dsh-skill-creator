@@ -1,0 +1,60 @@
+# @cloudplugin/dsh-skill-creator — bundle patch (inserted rows)
+# All in-process; there is no child engine and no listening port:
+#   Host  : registers the official creator skills (ctx.skills.registerProvider) and the
+#           panel API (ctx.webServer), and runs the creation flow by driving an agent
+#           (ctx.agents.create + agent.followup + agent/assistant-stream observation).
+#   Client: the run console rendered as its own centre panel (main keyed slot
+#           "skill-creator") reached from a sidebar.panellist icon — NOT in
+#           conversation.composer.dock, which is only "ambient entries below the
+#           composer card". (browser module id = package name, dsh.client.platform=web)
+- insert:
+    - id: dsh-skill-creator
+      name: '@cloudplugin/dsh-skill-creator'
+      config:
+        # Creator delegation: the two official creators are fetched from these repos and
+        # registered as loadable skills. Cache/TTL via env
+        # (DSH_SKILL_CREATOR_CACHE / DSH_SKILL_CREATOR_TTL_MS).
+        creators:
+          huawei:
+            repo: 'https://gitcode.com/huaweicloud/huaweicloud-skills.git'
+            branch: 'master'
+            path: 'skills/devtools/common/huawei-cloud-skill-creator'
+          generic:
+            repo: 'https://gitcode.com/grape-dev/grape-skills.git'
+            branch: 'main'
+            path: 'skills/coding/scaffolding/common-skill-creator'
+        # Live taxonomy for the 一级/二级/三级 dropdowns (gitcode contents API).
+        catalog:
+          repo: 'huaweicloud/huaweicloud-skills'
+          ref: 'master'
+          root: 'skills'
+          localDir: ''           # optional local clone; used only when the API fails
+          ttlMs: 600000          # per-path cache TTL (the API rate-limits bursts)
+        # Creation run: omit agentOptions to use the profile's default model selection.
+        #
+        # NO machine-specific values ship here. Both keys below are deliberately absent:
+        #  · cwd           — absent → the DSH host process cwd (verified on this build:
+        #                    the PROFILE dir, e.g. ~/.dsh/profiles/desktop), and the creator
+        #                    writes <cwd>/skills/<domain>/<product>/<name>. Set it to the
+        #                    workspace that should receive the skill.
+        #  · permissionPreset — absent → the deployment/session default preset is kept; the
+        #                    run never forces a permissive sandbox on someone else's machine.
+        # A creator MUST run bash (ensure_cli.sh / validate-skill.sh), which cannot fork
+        # inside a read-only/workspace-write sandbox, so an unattended run may stall on the
+        # escalation prompt. Opt in explicitly, understanding that:
+        run:
+          # cwd: '/absolute/path/to/your/workspace'
+          # permissionPreset: 'danger-full-access'
+          # agentPreset: 'standard'
+          # ── 技能评测（skill-verify-leader 口径，本地 10 分制）──────────────
+          # 通过线：10 分制 ≥ 8.5（即"85 分"）。稳定性 4 + 成本 1 + 效率 2 + 安全 3。
+          passScore: 8.5
+          # 最多 3 轮：每轮 = 一次评测（真跑只读用例）。0 = 关闭评测（只创建）。
+          # 到顶仍未达标 → status='below-threshold' 并交报告，不继续硬跑。
+          maxEvalRounds: 3
+          # 评测只跑 templates/test-vars.json 里 type=readonly|syntax 的用例，
+          # 写操作一律不跑（false 才放开，不建议）。
+          evalReadonlyOnly: true
+          # 静默阈值（无任何活动才判死）与整段绝对兜底
+          idleTimeoutMs: 480000
+          phaseTimeoutMs: 7200000
