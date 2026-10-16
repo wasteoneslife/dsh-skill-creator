@@ -24,10 +24,20 @@ window.__ModuleLoader__.load({
     const PANEL_ID = 'skill-creator';
     const NAME_PREFIX = 'huawei-cloud-';
     const CATALOG_ROOT = 'skills';
-    // Three categories. `api` is a declared placeholder: it renders no form and cannot
-    // start a run yet, but it already scopes the mode switch and the creation records.
-    const MODES = [['huawei', ' 华为云 skills '], ['generic', ' 通用 skills '], ['api', ' 通用 API ']];
-    const MODE_LABEL = { huawei: '华为云 skills', generic: '通用 skills', api: '通用 API' };
+    // Three categories, in MENU ORDER — this array is both the sidebar list and the
+    // display order, so 华为云基础云服务技能 is deliberately LAST. The mode KEYS are the
+    // Host contract (`POST /run` body `spec.mode`) and the record-scoping key: never
+    // rename them. To open the panel on a different category, change DEFAULT_MODE only.
+    // `api` is a declared placeholder: it renders one description form and scopes the
+    // creation records, exactly like the generic category.
+    const MODES = [
+      ['generic', '通用技能'],
+      ['api', '标准API管理技能'],
+      ['huawei', '华为云基础云服务技能'],
+    ];
+    const MODE_LABEL = { generic: '通用技能', api: '标准API管理技能', huawei: '华为云基础云服务技能' };
+    /** The category selected on open: the first menu item (通用技能). */
+    const DEFAULT_MODE = 'generic';
     /** States where the run is still doing work (creation, evaluation or a fix round). */
     const ACTIVE_STATES = ['creating', 'evaluating', 'fixing'];
     // The REST-API creator refuses to guess endpoints: it parses a document or probes with
@@ -67,8 +77,24 @@ window.__ModuleLoader__.load({
       page: { flex: '1 1 auto', minHeight: 0, height: '100%', overflowY: 'auto',
         boxSizing: 'border-box', color: 'var(--dsw-alias-label-primary)' },
       pageInner: { display: 'flex', flexDirection: 'column', gap: 12,
-        padding: '20px 24px 48px', maxWidth: 760, margin: '0 auto' },
+        padding: '20px 24px 48px', maxWidth: 940, margin: '0 auto' },
       head: { display: 'flex', alignItems: 'center', gap: 8, fontWeight: 600, fontSize: 16 },
+      // Category switcher: a fixed-width LEFT column + a self-sizing content column. The
+      // row wraps, so a narrow panel pushes the content below the menu instead of
+      // squeezing it. Neither column sets width:100%, which keeps the "one field per row"
+      // invariant measurable by the tests (a row-flex parent must not hold a field cell).
+      shell: { display: 'flex', alignItems: 'flex-start', flexWrap: 'wrap', gap: 16, width: '100%' },
+      menu: { display: 'flex', flexDirection: 'column', gap: 4,
+        flex: '0 0 180px', minWidth: 170, maxWidth: 200 },
+      menuItem: { display: 'block', boxSizing: 'border-box', textAlign: 'left', font: 'inherit',
+        fontSize: 12.5, padding: '7px 10px', cursor: 'pointer', borderRadius: 8,
+        background: 'transparent', border: '.5px solid transparent',
+        color: 'var(--dsw-alias-label-secondary)' },
+      menuItemActive: { background: 'var(--dsw-alias-bg-layer-2)',
+        border: '.5px solid var(--dsw-alias-border-l3)',
+        color: 'var(--dsw-alias-label-primary)', fontWeight: 600 },
+      content: { display: 'flex', flexDirection: 'column', gap: 12,
+        flex: '1 1 380px', minWidth: 260 },
       row: { display: 'flex', flexDirection: 'column', gap: 10 },
       cell: { display: 'flex', flexDirection: 'column', width: '100%' },
       card: { display: 'flex', flexDirection: 'column', gap: 4, padding: '10px 12px', borderRadius: 10,
@@ -134,7 +160,7 @@ window.__ModuleLoader__.load({
 
     function SkillCreator() {
       const [status, setStatus] = useState(null);
-      const [mode, setMode] = useState('huawei');
+      const [mode, setMode] = useState(DEFAULT_MODE);
       const [domains, setDomains] = useState(null);
       const [products, setProducts] = useState(null);
       const [domain, setDomain] = useState('');
@@ -188,7 +214,11 @@ window.__ModuleLoader__.load({
       }, []);
       useEffect(() => { if (!run) loadCreator(mode, false); }, [mode, loadCreator, run]);
 
+      // The three-level taxonomy is a Huawei-Cloud packaging rule, so it is fetched LAZILY
+      // — only once the panel actually shows the 华为云基础云服务技能 category (the default
+      // category asks for nothing but a description, and must not hit the repo on open).
       useEffect(() => {
+        if (mode !== 'huawei') return undefined;
         let cancelled = false;
         fetchCatalog(CATALOG_ROOT, tick > 0).then((r) => {
           if (cancelled) return;
@@ -196,10 +226,10 @@ window.__ModuleLoader__.load({
           setCatNote(r.note);
         });
         return () => { cancelled = true; };
-      }, [tick]);
+      }, [mode, tick]);
 
       useEffect(() => {
-        if (!domain) { setProducts(null); setProduct(''); return undefined; }
+        if (mode !== 'huawei' || !domain) { setProducts(null); setProduct(''); return undefined; }
         let cancelled = false;
         fetchCatalog(`${CATALOG_ROOT}/${domain}`, tick > 0).then((r) => {
           if (cancelled) return;
@@ -208,7 +238,7 @@ window.__ModuleLoader__.load({
           setCatNote(r.note);
         });
         return () => { cancelled = true; };
-      }, [domain, tick]);
+      }, [mode, domain, tick]);
 
       useEffect(() => {
         if (domains && domains.length && !domains.includes(domain)) {
@@ -308,16 +338,28 @@ window.__ModuleLoader__.load({
           : `❌ 未达标（通过线 ${r.passScore}）`);
 
       return h('div', { style: T.page }, h('div', { style: T.pageInner },
-        h('div', { style: T.head },
-          '⚡ Skill Creator',
-          h('span', { style: { marginLeft: 'auto' } },
-            run
-              // A creation can run for many minutes, so the detail view goes BACK rather
-              // than starting a new one — the run keeps going on the Host either way.
-              ? h('button', { style: T.btnGhost, type: 'button', onClick: () => { setRun(null); setCreatorNote(''); loadRuns(); } }, '← 返回')
-              : h(React.Fragment, null,
-                ...MODES.map(([value, label]) => h('label', { key: value },
-                  h('input', { type: 'radio', name: 'smode', checked: mode === value, onChange: () => setMode(value) }), label))))),
+        h('div', { style: T.head }, 'Scenes Skill Creator',
+          run
+            // A creation can run for many minutes, so the detail view goes BACK rather
+            // than starting a new one — the run keeps going on the Host either way.
+            ? h('span', { style: { marginLeft: 'auto' } },
+              h('button', { style: T.btnGhost, type: 'button', onClick: () => { setRun(null); setCreatorNote(''); loadRuns(); } }, '← 返回'))
+            : null),
+
+        // Category switcher: an in-page LEFT vertical menu — NOT top radios, and NOT a
+        // tab strip. The menu labels are for humans only; `setMode` still writes the
+        // `huawei|generic|api` keys the Host API and the record scoping use.
+        h('div', { style: T.shell },
+          !run && h('nav', { style: T.menu, 'aria-label': '技能类型' },
+            h('div', { style: T.label }, '技能类型'),
+            ...MODES.map(([value, label]) => h('button', {
+              key: value, type: 'button', 'data-mode': value,
+              'data-active': mode === value ? '1' : undefined,
+              'aria-current': mode === value ? 'true' : undefined,
+              style: { ...T.menuItem, ...(mode === value ? T.menuItemActive : {}) },
+              onClick: () => setMode(value),
+            }, label))),
+          h('div', { style: T.content },
 
         // Which creator runs, and the live run state.
         h('div', { style: T.card },
@@ -454,8 +496,8 @@ window.__ModuleLoader__.load({
         h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' } },
           !run && h('button', { style: T.btn, disabled: busy || !status || (mode !== 'huawei' && !genericReady), onClick: startRun }, busy ? '⏳ 启动中…' : '开始创建'),
           run && ACTIVE_STATES.includes(run.status) && h('button', { style: T.btnGhost, type: 'button', onClick: cancelRun }, '取消'),
-          creatorNote && h('span', { style: T.err }, creatorNote)),
-      ));
+          creatorNote && h('span', { style: T.err }, creatorNote))),
+      )));
     }
 
     /** Sidebar glyph: the sidebar passes the edge and paints it with `currentColor`. */
@@ -474,7 +516,7 @@ window.__ModuleLoader__.load({
           name: 'main', key: PANEL_ID,
         }, SkillCreator));
         ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
-          name: 'sidebar.panellist', id: PANEL_ID, order: 20, label: 'Skill Creator',
+          name: 'sidebar.panellist', id: PANEL_ID, order: 20, label: 'Scenes Skill Creator',
         }, SkillCreatorIcon));
       },
     };

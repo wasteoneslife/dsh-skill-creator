@@ -1,6 +1,6 @@
 {
   "name": "@cloudplugin/dsh-skill-creator",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "DeepSeek Harness plugin (bundle): visually create spec-compliant skills — Huawei Cloud mode per 《华为云基础云服务Skills和仓库管理规范》 / generic mode per agentskills.io",
   "license": "MIT",
   "icon": "./icon.svg",

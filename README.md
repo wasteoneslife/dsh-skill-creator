@@ -1,200 +1,295 @@
-# @cloudplugin/dsh-skill-creator
+# Scenes Skill Creator
 
-DeepSeek Harness 插件：**在面板里一键真跑官方 creator 的流程创建 Skill**，并实时展示每一步。
+**在 DeepSeek Harness 的 Web 界面里真跑官方 creator 技能——通用技能 / 标准API管理技能 / 华为云基础云服务技能——并实时展示过程、自动评测、不达标就打回修改。**
 
-插件自己**不生成技能**——创建技能是官方 creator 技能的职责（六阶段流水线）。插件负责：
+[![npm version](https://img.shields.io/npm/v/@cloudplugin/dsh-skill-creator.svg)](https://www.npmjs.com/package/@cloudplugin/dsh-skill-creator)
+[![license: MIT](https://img.shields.io/npm/l/@cloudplugin/dsh-skill-creator.svg)](https://github.com/wasteoneslife/dsh-skill-creator/blob/main/LICENSE)
 
-1. **按模式抓取最新的官方 creator**（缓存 + 记录 commit + 可刷新）
-2. **把它注册成 agent 可直接加载的 DSH skill**（`ctx.skills.registerProvider`）
-3. **起一个真 agent 执行 creator，并把运行过程变成可视步骤**（`ctx.agents.create` + `agent.followup` + `agent/assistant-stream`）
+包名 `@cloudplugin/dsh-skill-creator`，是一个 DSH bundle（Host 半边 + Client 半边，全部在 Harness 进程内，没有子进程、没有监听端口）。
 
-| 模式 | creator | 来源 |
-| --- | --- | --- |
-| 华为云 | `huawei-cloud-skill-creator` | `gitcode.com/huaweicloud/huaweicloud-skills` @ `master` → `skills/devtools/common/huawei-cloud-skill-creator` |
-| 通用 | `common-skill-creator` | `gitcode.com/grape-dev/grape-skills` @ `main` → `skills/coding/scaffolding/common-skill-creator` |
+## 它是什么
 
-**为什么这样设计**：creator 是「技能」而不是库，六阶段流程（苏格拉底式需求 → CLI/SDK/API 三级回退调研 → 文档生成 → 测试准备 → 详细测试 → 清理与合规）是 agent 干的活。填模板式的复刻只会得到功能不全的产物；委派之后上游怎么改、插件就跟着怎么改。
+官方 creator 技能（`common-skill-creator` / `rest-api-skill-creator` / `huawei-cloud-skill-creator`）是给命令行或会话里的 agent 用的：需求要自己写清、流程要自己盯、产物好不好要自己判断。本插件把这件事搬进 Web 界面：
 
-## 从 npm 安装
+1. **需求传递**：侧边栏选分类、填表单，插件把内容整理成 creator 能直接开工的请求（已经给全的值不再反问）。
+2. **过程展示**：按下「开始创建」后，Host 侧新起一个**真 agent** 执行该 creator 自己的流水线，面板实时渲染阶段清单与步骤日志。
+3. **评测闭环**：创建结束后真跑一遍 10 分制评测，不达标就把扣分明细交回**同一个** creator 就地修改，直到达标或用完轮数。
 
-```bash
-# DSH 内：让 agent 执行 plugin_manager install_bundle，target = 下面这个 spec（推荐，走 app 自己的审批流）
-@cloudplugin/dsh-skill-creator@0.0.1
+**插件自己不做内容创作**：SKILL.md 怎么写、references 怎么摆、脚本怎么跑，全部由该 creator 当前版本决定（插件不内嵌副本、不二次实现；上游改了，插件行为就跟着改）。
+
+## ✨ 主要特性
+
+- **分三类组织需求**：侧边栏为 通用技能 / 标准API管理技能 / 华为云基础云服务技能，创建记录按分类隔离，默认打开通用技能。
+- **真跑，不止给提示词**：创建由 creator 技能在真 agent 里执行；步骤日志逐条记录它的工具调用、阶段切换与模型报错。
+- **实时展示阶段与步骤**：阶段清单按 creator 自己的标记点亮（华为云 Phase 1–6 / 通用技能 阶段 1–5 / 标准API Step 1–4），运行中每 1 秒刷新。
+- **自动评测并打回修改**：10 分制、通过线 8.5；不达标把扣分明细发回同一个 creator 修改，最多 3 轮，到顶输出评测报告。
+- **无人值守也不提问**：提示词里禁止提问；creator 若仍然提问，插件按"只读、不执行变更类操作"的策略自动答复并继续（最多 5 次）。
+- **保护长任务不被误杀**：看门狗按**静默**判死（默认静默 8 分钟、整段 120 分钟兜底），并识别进程被挂起（休眠）后重新计时。
+- **回看历史并可靠落盘**：运行记录原子写入磁盘（临时文件 + 重命名 + 备份 + 与磁盘记录合并去重），bundle 重载或 DSH 重启后仍能重新打开，最多保留 20 条。
+- **自动发现产物目录**：通用/标准API 模式没有名称与目录字段，评测阶段从 creator 写文件的路径、以及 `<cwd>/skills` 下新出现的 `SKILL.md` 自动定位产物。
+- **按需拉取华为云三级目录**：只有切到华为云分类才访问仓库，逐级读取并缓存（默认每路径 10 分钟）；默认分类打开页面不发请求。
+
+## 快速开始
+
+两种安装方式。装完后**必须重启 DSH 一次**——bundle 列表与补丁层只在启动时解析（不重启的表现是侧边栏没有图标，或面板 API 404）。
+
+**方式一 · DSH 内（任意 profile，推荐）**：在会话里让 agent 用 Harness 自带的插件管理安装这个 spec：
+
+```text
+@cloudplugin/dsh-skill-creator
 ```
 
-或等价的 CLI 路径（把包装进某个 profile 并把它的包名加进该 profile 的 `dsh.profile.bundles`）：
+**方式二 · 桌面端 profile（命令行）**：把依赖装进 profile 目录，并把**同一个包名**加进该 profile `package.json` 的 `dsh.profile.bundles` 数组（两处都要有）：
 
-```bash
+```sh
+cd ~/.dsh/profiles/desktop
+pnpm add @cloudplugin/dsh-skill-creator   # 或用 npm install
+```
+
+```powershell
+cd $env:USERPROFILE\.dsh\profiles\desktop
+pnpm add @cloudplugin/dsh-skill-creator   # 或用 npm install
+```
+
+> **⚠️ 装完必须重启 DSH 一次**：profile 的 `node_modules` 解析、`dsh.profile.bundles` 与 `cordis.patch.yml` 都只在启动时生效。
+>
+> 另外，安装用的包名必须与 `src/client.js` 里 `window.__ModuleLoader__.load({ id })` 的 id 完全一致（本包都是 `@cloudplugin/dsh-skill-creator`），不一致时浏览器侧会直接报 `bundle … loaded without registering "…"`。
+
+最小可用配置（写进 profile 的 `cordis.patch.yml`，`id` 与包内补丁一致）：
+
+```yaml
+- id: dsh-skill-creator
+  name: '@cloudplugin/dsh-skill-creator'
+  config:
+    run:
+      cwd: '/absolute/path/to/your/workspace'
+      permissionPreset: 'danger-full-access'
+      passScore: 8.5
+      maxEvalRounds: 3
+      evalReadonlyOnly: true
+      idleTimeoutMs: 480000
+      phaseTimeoutMs: 7200000
+```
+
+`run.cwd` 是技能落盘根，产物写在 `<cwd>/skills/…`。不设时回落到 DSH host 进程的 cwd（实测就是 profile 目录），技能会被写进 profile 里而不是你的工作区。上面的 `run` 键要写全，原因见「配置」一节的坑。
+
+### 命令行安装（等价方式）
+
+```sh
+# Web / 普通 profile
+dsh plugin add @cloudplugin/dsh-skill-creator
+
+# 桌面端：先完全退出客户端，再指定 desktop profile
 dsh plugin --profile desktop add @cloudplugin/dsh-skill-creator
 ```
 
-装完 **重启 DSH**：profile 的 `dsh.profile.bundles` / `node_modules` 解析只发生在启动时。
+装完**重启一次 DSH**。桌面端的 `dsh` CLI 随安装包提供（`resources\runtime\cli\bin\dsh.cmd`）；若手边没有该命令，也可以在插件页里直接填包名 `@cloudplugin/dsh-skill-creator` 安装。
 
-- 本包是 **bundle**：`package.json` 里 `dsh.bundle.patch` → `cordis.patch.yml` 往 Cordis 插件树插一行；`dsh.client.platform = web` + `exports["./client"]` 提供浏览器半部。
-- **包名必须与 `src/client.js` 里 `window.__ModuleLoader__.load({ id })` 完全一致**（两者一个是 install 名、一个是浏览器模块名；不一致时浏览器侧直接报 `bundle … loaded without registering "…"`）。
-- 本地开发可以用 `link:` 装（例如 profile 的 dependencies 写 `"@cloudplugin/dsh-skill-creator": "link:D:/path/to/repo"`）；`link:` 只在包名与依赖键一致时才能被解析到。
-- **装完必须配置 `config.run.cwd`**（默认回落到 DSH host 进程的 cwd，实测就是 profile 目录），否则技能会写进 profile 目录而不是你的工作区。见下面「运行配置」。
+## ⚠️ 权限要求（必读）
 
-## 工作方式
+> **发布包默认 `run.permissionPreset: 'danger-full-access'`**（写在包内 `cordis.patch.yml` 里，不是文档假设）。
+>
+> 原因：creator 流程要跑 bash 脚本（`ensure_cli.sh` / `validate-skill.sh` / `test-cli-commands.sh`）与云 CLI，这些 fork 在只读或 `workspace-write` 沙箱下会被审批拦住。无人值守时没有人点「允许」，运行就静默，随后被看门狗判死——表现为**"跑一半超时退出"**（本机运行记录里确有 `permission: null` 的运行以 `等待「creator」超时：已静默 8 分钟（无任何工具调用或文本）` 结束）。
+>
+> **风险**：创建与评测 agent 都会以完全访问权限运行（可读写文件、执行命令）。请只在**信任的工作区**使用本插件。若改成受限 preset，请确保有人在场处理审批，否则长任务大概率静默超时。
 
-```
-面板（填需求）
-   └─ POST /dsh-skill-creator/api/run
-        └─ Host：ctx.agents.create()              新建一个真 agent（用 profile 默认模型）
-             agent.followup(creator 请求)         把需求交给 creator 技能
-             ctx.on('agent/assistant-stream', …)  把流式帧转成步骤
-   └─ 面板每 1 秒 GET /run?id=…                    渲染阶段清单 + 步骤日志
-```
+## 三种技能类型
 
-- **阶段清单**：扫描 creator 自己的 `Phase 1..6` 标记，实时把六阶段点亮
-- **步骤日志**：工具调用（`read_file`/`bash`/`skill` …）与阶段切换逐条记录，含模型报错
-- **可控**：运行中可「取消」（`agent.cancel` + 释放句柄）；运行结束可「新建」再跑一次
-- **产物位置**：技能落在 creator Phase 3 规定的 `<root>/<domain>/<product>/<name>`，面板日志里能看到它写的每一步
+| 显示名（侧边栏顺序） | 内部 `mode` | 委托的官方 creator | 来源 |
+| --- | --- | --- | --- |
+| 通用技能 | `generic` | `common-skill-creator` | [grape-skills](https://gitcode.com/grape-dev/grape-skills) `main` → `skills/coding/scaffolding/common-skill-creator` |
+| 标准API管理技能 | `api` | `rest-api-skill-creator` | [grape-skills](https://gitcode.com/grape-dev/grape-skills) `main` → `skills/coding/scaffolding/rest-api-skill-creator` |
+| 华为云基础云服务技能 | `huawei` | `huawei-cloud-skill-creator` | [huaweicloud-skills](https://gitcode.com/huaweicloud/huaweicloud-skills) `master` → `skills/devtools/common/huawei-cloud-skill-creator` |
 
-## API（全部跑在 Host 进程内）
+- 显示名就是侧边栏菜单文案，**数组顺序即菜单顺序（华为云固定最后）**，默认选中第一项（通用技能）。
+- 内部 `mode` 键是 Host API 契约（`POST /run` 的 `spec.mode`）与记录隔离键；改显示名不动它。
+- **记录按分类隔离**：创建记录卡片只列出当前分类的历史。
+- **三级目录按需拉取**：只有切到华为云分类才访问仓库（逐级读取，默认每路径缓存 10 分钟）。
+- 三个 creator 都会按需注册为可加载的 DSH skill，缓存 24 小时，可点「从仓库拉取最新」强制刷新。
 
-`ctx.webServer.register({kind:'prefix', path:'/dsh-skill-creator/api', handler})` —— **同源**，所以面板里都是相对路径 fetch，没有端口、没有 CORS、没有跨进程：
+各分类要填什么：
 
-| 路由 | 作用 |
+| 分类 | 表单字段 |
 | --- | --- |
-| `GET /status` | 目录源描述 + 两个 creator 的状态 |
-| `GET /catalog?path=…&refresh=1` | 逐级读仓库目录（一级/二级/三级下拉） |
-| `GET /creator?mode=…&refresh=1` | creator 状态，`refresh=1` 时从仓库拉最新 |
-| `POST /run` | **启动一次真创建**（起 agent、发请求、开始记录） |
-| `GET /run?id=…` / `GET /run` | 单次运行快照 / 运行列表 |
-| `POST /cancel` | 取消一次运行 |
-| `POST /handoff` | 只产出请求文本（备用：想自己在对话里发时用） |
-| `POST /validate` | 本地校验器审一个技能包 |
+| 通用技能 | 一个「技能功能描述」文本框（≥8 字符）。没有名称、目录、tags 字段——这些是打包约定，由该 creator 自己推导。 |
+| 标准API管理技能 | 一个「REST API 技能需求」文本框（≥8 字符），占位符是一份需求模板：技能名称 / 一句话描述 / 目标系统 / API 地址 / 认证方式 / **API 文档**。 |
+| 华为云基础云服务技能 | 一级目录（固定 `skills`，不可改）+ 二级目录 + 三级目录（均从仓库实时读取）+ 技能名（前缀 `huawei-cloud-` 固定，后缀 1–64 字符小写字母/数字/连字符）+「功能概括」文本框（可留空）。技能名即仓库路径第四级：`skills/<二级>/<三级>/<技能名>`。 |
 
-## DSH 集成（实测契约，DeepSeek Harness 0.0.1-rc.2）
+**标准API模式里「API 文档」最关键**：该 creator 不猜端点——它解析你给的文档，或用 curl 实测探测；两者都拿不到就不产出。请把凭据放进环境变量，不要写在这段文本里。
 
-- 结构：`package.json` 声明 `dsh.bundle.patch`（→ `cordis.patch.yml` 插入一行）+ `dsh.client`（platform=web）＋ `exports ./client`
-- **Host 半部** `src/core/plugin.mjs`（一个 `ctx.effect` 拥有全部注册与回收）：
-  - `ctx.skills.registerProvider(...)`：两个 creator 作为 skill 暴露（`resourceBase: {kind:'directory', path}`，脚本路径可用；`get()` 返回 SKILL.md 全文）
-  - `ctx.webServer.register(...)`：面板 API
-  - `ctx.agents.create({agentOptions})` → `AgentHandle{agent, dispose}`；`agent.followup({content, source})` 唤醒；`agent.whenIdle()` 收尾；`agent.cancel(cause)` 中止
-  - `'agent/assistant-stream'(…, {agent, frame})`：`frame.type = start|chunk|end`，`chunk.type = text-delta|tool-call-delta|block-end|finish`
-  - 本运行时 Cordis 只派发 `internal/*` 事件，**`ctx.on('ready')`/`ctx.on('dispose')` 永不触发** → 一律用 `ctx.effect`
-- **Client 半部** `src/client.js`：`window.__ModuleLoader__.load({id: 包名, factory(require){…}})` 官方格式；面板注册为**独立主面板**（同一 id 同时注册 `sidebar.panellist` 与 `main` keyed slot，与官方 Plugins 页同构），**刻意不用 `conversation.composer.dock`**（那是"composer 下方的环境条目"，放整页表单会挤掉对话区）
-- 生效方式：
-  - 客户端 `src/client.js`：刷新页面
-  - Host 入口 `src/core/plugin.mjs`：设置 → 插件里禁用/启用本 bundle（实测有效）
-  - **Host 其他 core 模块**（`runner.mjs` / `routes.mjs` / `creators.mjs`…）：**必须重启 DSH**——bundle 重载只重新导入入口模块，其静态依赖命中 Node 的 ESM 模块缓存，改动不会生效（已踩坑）
-- 依赖声明是硬要求：本插件 `export const inject = ['webServer', 'skills']`。若把注册藏在一次性的 `ctx.get('webServer')` 后面，插件会比该服务先激活并**静默不注册任何路由**——表现为"面板 API 404"，而 skill provider 却正常，极具误导性
+## 工作流程
 
-## 抓取方式
+```text
+填需求（选分类 + 填表单）
+  └─ POST /dsh-skill-creator/api/run
+       └─ Host：ctx.agents.create() 起一个真 agent
+            agent.followup(creator 请求)           把需求交给 creator 技能
+            ctx.on('agent/assistant-stream', …)    把流式帧转成阶段与步骤
+       └─ 面板每 1 秒 GET /run?id=…                 渲染阶段清单 + 步骤日志
 
-- **git sparse clone**：`git clone --depth 1 --branch <branch> --filter=blob:none --sparse` + `sparse-checkout set <path>` —— 实测 **2.1 s / 2.4 s**，只取 creator 子树
-- 仓库 archive 路由**不可用**（返回 200 但 `Content-Type: text/html` 登录页）；无 git 时回退 contents API（每 creator 14–17 请求，会限流，仅兜底）
-- 缓存：`$DSH_SKILL_CREATOR_CACHE`（默认 `%TEMP%/dsh-skill-creator-cache`），每模式 `stamp.json` 记录 repo/branch/path/**commit**/fetchedAt，TTL 24h（`DSH_SKILL_CREATOR_TTL_MS`）；拉取失败继续用旧副本并标 `stale`
-
-## 实时目录（一级 / 二级 / 三级）
-
-| 下拉 | 目录 | 取值 |
-| --- | --- | --- |
-| 一级目录（固定根） | `skills` | 恒为 `skills` |
-| 二级目录 | `skills/<二级>` | `computing`、`network`、`ai`…（16 个） |
-| 三级目录 | `skills/<二级>/<三级>` | `computing` → `ecs`、`flexus-l`、`flexus-x`… |
-
-走 Gitee 风格 contents API（GitLab 风格的 `/api/v4/.../repository/tree` 在该站 404）；每路径 10 分钟缓存（`catalog.ttlMs`）；限流/断网先给过期缓存、再退到可选本地克隆（`catalog.localDir`）。技能名是**第四级**：`huawei-cloud-` 前缀写死 + 用户填后缀。
-
-## 命令
-
-```bash
-npm test                       # node --test（125 个用例）
-npm run creator:status         # 两个 creator 的缓存状态（含 commit）
-npm run creator:refresh        # 强制拉最新
-npm run audit -- <skill-dir>   # 用 creator 自带的 validate-skill.sh 审一个技能包
-node bin/dsh-skill-create.mjs --mode huawei --domain computing --product ecs \
-     --name ecs-manage --summary "Manage ECS via KooCLI"   # 只打印请求文本（不开面板时用）
+创建结束（creator 空闲）
+  └─ 目标目录自动发现（通用/标准API 模式表单里没有名称，路径由 creator 决定）
+       └─ 评测第 1 轮（真跑只读用例，10 分制）
+            ├─ 得分 ≥ 8.5 ──────────────────────► done（附评测报告）
+            └─ 得分 < 8.5 → 扣分明细 followup 回同一个 creator 就地修改（fixing）
+                 └─ 评测第 2 轮 … 最多 3 轮
+                      ├─ 本轮提升 < 0.2 ────────► below-threshold（早停，附报告）
+                      └─ 3 轮到顶仍未达标 ──────► below-threshold（附报告）
 ```
 
-## 技能评测（10 分制，通过线 8.5）
+运行状态：`creating` → `evaluating` →（`fixing` → `evaluating`）* → `done` / `below-threshold`；任何阶段都可能 `cancelled` / `failed`，进程重启后残留的进行中记录会标为 `interrupted`。运行中可「取消」，结束后可「← 返回」再开一次。
 
-创建完成的 skill 会被**真跑一遍评测**，不达标就把扣分明细交回同一个 creator 就地修改，直到达标或用完轮数。
+各 creator 的阶段清单（阶段标题就是面板上显示的文案，插件按 creator 自己的标记点亮，**只前进不回退**）：
 
-```
-creating → evaluating(第 1 轮) → done                       得分 ≥ 8.5
-         → evaluating(第 1 轮) → fixing → evaluating(第 2 轮) …
-         → below-threshold                                  3 轮到顶仍未达标
-```
+| 分类 | 阶段 |
+| --- | --- |
+| 华为云 | Phase 1 · 需求分析（苏格拉底式问答） |
+| 华为云 | Phase 2 · 技术调研（CLI→SDK→API 三级回退） |
+| 华为云 | Phase 3 · 文档生成（SKILL.md + references + 载体） |
+| 华为云 | Phase 4 · 测试准备（templates/test-vars.json） |
+| 华为云 | Phase 5 · 详细测试（真实执行验证） |
+| 华为云 | Phase 6 · 资源清理与合规检查 |
+| 通用技能 | 阶段 1 · 需求分析 |
+| 通用技能 | 阶段 2 · 设计 |
+| 通用技能 | 阶段 3 · 生成（skill 包 + 模板） |
+| 通用技能 | 阶段 4 · 验证（规范 + lint 检查点双通过） |
+| 通用技能 | 阶段 5 · eval 迭代 |
+| 标准API | Step 1 · 需求澄清 |
+| 标准API | Step 2 · 技术调研 |
+| 标准API | Step 3 · 骨架生成 |
+| 标准API | Step 4 · 自测与收尾（创建 PR/交棒属平台流水线，本面板不做） |
 
-**口径照抄 `skill-verify-leader`**（不自己发明），10 分制 12 项：
+## 评测机制（10 分制，通过线 8.5）
+
+创建结束后**真跑一遍评测**：由评测 agent 在被测 skill 目录里执行只读用例，再由本地评分器按平台口径打分。
 
 | 维度 | 满分 | 明细 |
 | --- | --- | --- |
 | 稳定性 | 4 | 功能可用 3 + 触发词充足度 1 |
-| 成本 | 1 | 消耗总 token 1 |
-| 效率 | 2 | 完成时间 / 工具失败次数 / 重试次数 / cli·sdk·api 调用次数 / LLM 调用次数 / 上下文压缩，8 × 0.25 |
-| 安全 | 3 | 本地规则扫描：高危 ≥1 → −3；告警 ≥2 → −2；告警 1 → −1 |
+| 成本 | 1 | 消耗总 token |
+| 效率 | 2 | 8 项 × 0.25：完成时间 / 工具失败次数 / 重试次数 / cli / sdk / api 调用次数 / LLM 调用次数 / 上下文是否压缩 |
+| 安全 | 3 | 本地规则扫描：高危 ≥1 扣 3；告警 ≥2 扣 2；告警 1 扣 1 |
 
-- **成本/效率是相对基线、单向容差 10%**（只罚超支，不罚更省）：本地没有平台 DB，**首轮即基线**，后续轮次与首轮比
-- 分级参考平台：`=10 技能满分`、`[8,10) 优质技能`；本插件**通过线 8.5/10**（即"85 分"）
+- **通过线 8.5/10**（即"85 分"）；分级参考平台：`=10` 技能满分、`[8,10)` 优质技能。
+- **容差 10% 且单向**：成本与效率只罚超支、不罚更省；基线为 0 视为无参照，恒通过。
+- **首轮即基线**：第 1 轮没有可比基线，因此成本（1 分）与效率（2 分）自动满分——首轮得分主要看稳定性与安全，也更容易达标（见「边界」第 4 条）。
+- **只跑只读/语法用例**：取 `templates/test-vars.json`（或 `test-defaults.json`）里 `type` 为 `readonly` / `syntax` 的用例，最多 20 条，**写操作一律不执行**（`evalReadonlyOnly: false` 才放开，不建议）。没有用例文件时，评测 agent 从 `SKILL.md` 的命令区自行挑只读命令。
+- **无提升早停**：本轮比上轮提升 < `minImprovement`（默认 0.2）时提前结束并出报告，不把 3 轮跑满。
 
-**指标来源（不需要 CodeArts / Hermes / OBS）**：
+指标来源（全部本地，不需要 CodeArts / Hermes / OBS）：
 
 | 指标 | 本地来源 |
 | --- | --- |
-| token | 评测会话 `assistant/message.data.usage` 逐条累加 |
+| token | 评测会话 `assistant/message.data.usage` 累加 |
 | 工具失败 | `tool/result` 的 `error` / `message.isError` |
 | 重试 | 连续两次完全相同的工具调用 |
 | 完成时间 | 评测轮的墙钟时长 |
-| cli / sdk / api 调用 | 工具调用文本按 `config.py` 的 `LOG_PATTERNS` 移植分类 |
+| cli / sdk / api 调用分类 | 工具调用文本按平台 `LOG_PATTERNS` 的本地移植分类 |
 
-**只跑只读用例**：评测只取 `templates/test-vars.json` 里 `type=readonly|syntax` 的用例，**写操作一律不跑**（`evalReadonlyOnly: false` 才放开，不建议）。没有用例文件时，评测 agent 从 `SKILL.md` 的命令区自行挑只读命令。
+**未纳入的平台侧信号**（报告里逐条标注，不猜测、不扣分）：
 
-**未纳入（平台侧信号缺失）**——报告里会明确标注，不猜测、不扣分：
-
-- 外部门禁扣分（`skills_test` 测试结论 / `skills_bot` 审查结论、`pr`/`simulate` 模式上限）
-- CodeArts / Hermes 运行时导出（用同一会话的 usage 与工具事件代替）
+- 外部门禁扣分（`skills_test` 测试结论 / `skills_bot` 审查结论）
+- `pr` / `simulate` 模式的功能可用扣分上限
+- CodeArts / Hermes 运行时导出（本评测用同一会话的 usage 与工具事件代替）
 - 上下文压缩事件（本地不可观测，按"未压缩"计入，不扣分）
 
-**配置**（`cordis.patch.yml` → `config.run`）：
+## 配置
 
-| 键 | 默认 | 含义 |
+配置写在 `cordis.patch.yml` 的 `config` 下；下表的默认值取自代码与包内补丁文件。
+
+| 键 | 默认值 | 说明 |
 | --- | --- | --- |
-| `cwd` | 不设 → DSH host 进程 cwd（= profile 目录） | 技能落盘根：`<cwd>/skills/<domain>/<product>/<name>`。**发布版请显式设置** |
-| `permissionPreset` | 不设 → 沿用部署/session 默认 | 创建 agent 的权限 preset。creator 要跑 bash，只读沙箱下会卡在审批；确定要无人值守再显式设 `danger-full-access` |
-| `passScore` | `8.5` | 通过线（10 分制） |
-| `maxEvalRounds` | `3` | 最多评测轮数；`0` = 关闭评测，只创建 |
-| `evalReadonlyOnly` | `true` | 只跑只读/语法用例 |
+| `run.cwd` | 不设 → DSH host 进程 cwd（实测 = profile 目录） | 技能落盘根 `<cwd>/skills/…`。**发布环境请显式设置**，否则写进 profile |
+| `run.permissionPreset` | `'danger-full-access'`（包内默认） | 创建/评测 agent 的权限 preset，见上面「权限要求」 |
+| `run.passScore` | `8.5` | 通过线（10 分制） |
+| `run.maxEvalRounds` | `3` | 最多评测轮数；`0` = 关闭评测，只创建 |
+| `run.evalReadonlyOnly` | `true` | 只跑只读/语法用例 |
+| `run.idleTimeoutMs` | `480000`（8 分钟） | 无任何工具调用或文本即判死；收到活动就重新计时 |
+| `run.phaseTimeoutMs` | `7200000`（120 分钟） | 单个创建/评测阶段的绝对兜底（旧键 `run.evalTimeoutMs` 亦可） |
+| `run.minImprovement` | `0.2` | 修复轮提升低于此值就早停；`0` 关闭 |
+| `run.agentPreset` | 不设 → 部署默认 preset（实测 `standard`） | 创建与评测 agent 使用的 preset |
+| `run.agentOptions` | 不设 → profile 默认模型 | 覆盖 provider / model |
+| `run.wakeGraceMs` | `1200` | `whenIdle()` 之前的宽限期（防"消息未被受理"被当成已完成） |
+| `run.persistDebounceMs` | `1500` | 运行中落盘的防抖间隔 |
+| `run.idlePollMs` | `15000` | 看门狗轮询间隔（超过 5 倍间隔即视为进程被挂起） |
+| `catalog.repo` | `'huaweicloud/huaweicloud-skills'` | 华为云三级目录来源 |
+| `catalog.ref` | `'master'` | 目录来源的引用 |
+| `catalog.root` | `'skills'` | 一级目录（固定根） |
+| `catalog.localDir` | `''` | 可选本地克隆，仅当目录 API 失败时兜底 |
+| `catalog.ttlMs` | `600000`（10 分钟） | 每个目录路径的缓存时长 |
+| `catalog.timeoutMs` | `15000` | 单次目录请求超时 |
 
-> **本机（作者）覆盖**：本机用 `C:\Users\<你>\.dsh\profiles\desktop\cordis.patch.yml` 这个「profile 补丁层」把 `run.cwd` + `run.permissionPreset: danger-full-access` 覆盖回来——它在本 bundle 层**之后**应用，所以本机行为不变，而发布出去的文件里不含任何机器专属取值。
-> 注意 patch 语义是**整键替换**（不是深合并）：profile 里给 `config` 就必须给完整的 `config`，否则会丢掉 `creators` / `catalog`。
+环境变量：`DSH_SKILL_CREATOR_CACHE`（creator 缓存与运行记录目录，默认 `%TEMP%\dsh-skill-creator-cache`）、`DSH_SKILL_CREATOR_TTL_MS`（creator 缓存 TTL，默认 24 小时）。
 
-到顶仍未达标时 `status='below-threshold'`，run 上带 `report`（各轮得分表 + 末轮明细 + 扣分项）与 `error` 说明，**不会继续硬跑**。面板运行卡片显示 `评测 8.70/10（第 2 轮）`、四个维度得分、扣分明细与报告。
+> **坑：profile 覆盖层是逐顶层键整体替换，不是深合并。** 在 `~/.dsh/profiles/<name>/cordis.patch.yml` 里覆盖 `config` 时，该块是整体赋值：所以要覆盖 `run` 就把想保留的 run 键写全——例如少写 `permissionPreset`，等于把发布包的 `danger-full-access` 默认值丢掉，运行会退回部署默认权限（很可能卡在审批上）。
+>
+> 另外：包内 `cordis.patch.yml` 的 `creators:` 段当前**不被插件读取**（三个分类由 `src/core/creators.mjs` 内置），改它不会改变走哪个 creator。
 
-## 测试覆盖
+## 运行环境
 
-- `test/evaluator.test.mjs` — 评分数学：12 项权重/满分=10、10% 单向容差、自基线、触发词两档、安全扣分档位、阈值判定、指标归约（token/失败/重试/调用分类）、只读用例过滤、安全规则扫描、评测提示词与 JSON 解析、修复提示词、报告
-- `test/runner.test.mjs` — 执行器与**评测循环**：默认模型选择、提示词内容、`assistant-stream` 帧 → 阶段点亮/工具入日志/错误上报、`whenIdle` 收尾、取消释放、缺 `agents` 服务时报错、达标早停、fail→pass 第 2 轮达标、3 轮到顶 → `below-threshold`、`maxEvalRounds=0` 关闭、真实评测轮起独立评测 agent
-- `test/routes.test.mjs` — 面板 API 全部路由 + 未知路由/异常都返回 JSON
-- `test/creators.test.mjs` — 模式↔仓库映射、无网状态、两种模式的请求文案
-- `test/client.test.mjs` — 假 React 渲染真实组件树：每个 `select` 必带 `option`、每个 `Field` 必带控件、一行一个控件、必须 POST `/run` 且不再连私有端口
-- `test/catalog.test.mjs` — 路径穿越、TTL 缓存、断网走本地克隆、限流走过期缓存
-- `test/validators.test.mjs` — 本地校验器逐条用例（rule 14 四件、必备章节、`hcloud-unwrapped`）
-- `test/yaml.test.mjs`、`test/bundle.test.mjs` — mini YAML 解析器；DSH bundle 契约
+| 依赖 | 用途 | 备注 |
+| --- | --- | --- |
+| Node.js ≥ 18 | 插件本体与 `bin/` 脚本 | `package.json` 的 `engines` |
+| DSH 本体 | 提供 `webServer` / `skills` / `agents` 服务 | Host 契约实测于 0.2.0-rc.2 |
+| git | 抓取 creator（sparse clone，只取 creator 子树） | 无 git 时回退 gitcode contents API（慢，可能 429） |
+| bash | 跑 creator 自带脚本（`ensure_cli.sh` / `validate-skill.sh` / `test-cli-commands.sh`） | Windows 用 Git Bash；沙箱要允许 fork |
+| python3 | creator 脚本用它做 JSON/哈希处理（如 `yaml-check-frontmatter.py`） | 没有 `python3` 时脚本回退 `python` |
+| 网络可达 gitcode.com | 抓 creator 与华为云三级目录 | 失败时继续用旧副本并标 `stale` |
+| 华为云 hcloud 凭据（AKSK profile） | 华为云模式：creator 的 Pre-check 与评测只读用例 | 只读巡检也需要可用的 hcloud profile |
+| 目标系统可达（URL + 凭据） | 标准API模式：解析文档或用 curl 探测 | 探测不到就不产出 |
 
-## 已知边界（诚实声明）
+## 边界与已知限制
 
-1. **真实创建需要华为云凭据**：creator 的 Pre-check 是硬门槛，Phase 2/4/5 会真的跑 `hcloud`。没凭据时前段能跑，实测阶段会停在 ⛔ 并把原因写进日志——这是 creator 自己的设计。
-2. **抓取需要 git**：没有 git 时回退 contents API，慢且可能被限流（HTTP 429）。
-3. **本地 `validators.mjs` 是近似实现**：权威裁定者是 creator 自带的 `scripts/validate-skill.sh`（`npm run audit` 用的就是它），规则变更时本地版本可能滞后。
-4. **并发**：每次点「开始创建」起一个新 agent 会话；面板按运行 id 分别记录，最多保留 20 条。
-5. **评测的代价**：一轮评测 = 再起一个 agent 并真跑一遍只读用例。3 轮循环意味着最多 1 次创建 + 3 次评测、4 个 agent 会话；到顶仍未达标会停在 `below-threshold` 并给报告，不会无限重试。
-6. **评测口径是"平台口径的本地实现"**：评分公式与权重逐条照抄 `skill-verify-leader`，但指标采集用本地会话事件替代 CodeArts/Hermes 导出，外部门禁扣分不参与（报告中标注「未纳入（平台侧信号缺失）」）。因此本地 8.5 与平台 8.5 **同口径但非同源**。
-7. **修复由 creator 自己完成**：扣分明细通过 `followup` 发回同一个 creator agent（它已掌握上下文）。若 creator 反复改不动，会被 3 轮上限兜住——这属于设计预期，不是失败。
-8. **生效边界**：`src/client.js` 改动刷新页面即可；`src/core/runner.mjs`（含新模块 `evaluator.mjs`）靠禁用/启用 bundle 重新加载；`cordis.patch.yml` 的 `config.run` 需要一次 DSH 重启才应用。
+1. **不做内容创作**：SKILL.md、references、测试模板都由 creator 生成，插件只负责传需求、展示过程、评测产物。
+2. **不做平台流水线的事**：creator 流程尾部的"创建 PR → A2A 交棒 QA"只在平台内可用；本面板独立运行、禁止远端推送，所以标准API模式最后一段只走到自测与收尾。
+3. **评测是"同口径、不同源"**：评分公式、权重、容差逐条照抄 `skill-verify-leader`，但指标来自本地会话事件，外部门禁扣分不参与（报告里标注"未纳入"）。本地 8.5 与平台 8.5 口径相同、数据来源不同。
+4. **首轮偏松**：首轮即基线，成本与效率自动满分，得分主要反映稳定性与安全；另外当评测 agent 没有给出结构化结论时，"功能可用"会退化为本地结构校验判定（报告里写明依据）。
+5. **评测只覆盖只读/语法用例**：写操作与资源生命周期用例一律不跑，所以"能读"不等于"能改"。
+6. **没有单轮 token/时间预算**：只有与基线比对的超支容差；`maxEvalRounds` 限的是轮数，不是花费。
+7. **一次完整流程是十几到几十分钟量级**：创建 + 每轮评测各起一个真 agent（最多 1 次创建 + 3 次评测 = 4 个会话），轮次越多越慢。
+8. **本地校验器是近似实现**：权威裁定是 creator 自带的 `scripts/validate-skill.sh`（`node scripts/audit-skill.mjs <skill-dir>` 用的就是它）。本地结构校验的 error 数与评测结论可能不一致，评测 agent 的结论优先。
+9. **记录有上限**：最多保留最近 20 条运行，每条最多 200 步（内存日志窗口 400 步）；超出后淘汰最旧的**已结束**运行，进行中的不会被淘汰。
+10. **华为云模式需要凭据**：creator 的 Pre-check 是硬门槛；没有可用凭据时前段能跑，后续步骤会停下并把原因写进日志。
+11. **默认权限偏大**：发布包默认完全访问权限（见「权限要求」），这不是最小权限默认值。
+12. **生效方式不同**：`src/client.js` 改动刷新页面即可；核心模块改动需要禁用/启用一次 bundle（插件每次 apply 都以查询参数重新导入核心模块）；包名 / `cordis.patch.yml` / `dsh.profile.bundles` 只在启动时解析，**必须重启 DSH**。
 
+## 验证情况
 
-## 开发/维护命令（不在发布包内）
+- **单元测试**：`node --test` → **132 个用例 / 18 个套件全部通过**（0 失败）。
+- **端到端实跑**（三种模式各一次，作者本机：Windows + Git Bash + KooCLI）：
 
-这些脚本被 `package.json` 的 `files` 白名单排除，**只在仓库内可用**，因此不再作为 npm script 暴露给安装者：
+| 模式 | 产物 | 结果 |
+| --- | --- | --- |
+| 华为云基础云服务技能 | `skills/bigdata/mrs/huawei-cloud-mrs-manage` | 第 1 轮 10.00/10 达标 |
+| 通用技能 | `skills/text/markdown-notes-index` | 第 1 轮 10.00/10 达标 |
+| 标准API管理技能 | `skills/jsonplaceholder-posts` | 第 1 轮 10.00/10 达标 |
 
-```bash
-node scripts/audit-skill.mjs     # 仓库内审计自己
-node src/core/dsh-install.mjs    # 仅作者：把本仓库装进 DSH profile（绕过 pnpm，会改 profile 的 package.json）
-node scripts/recover-runs.mjs    # 从 session 日志重建创建记录（幂等）
+三次运行均为**零提问、零运行错误**（自动答复 0 次、错误步骤 0 条、工具失败 0 次）。这些数字来自本机运行记录（面板「创建记录」读的就是它），不是估算。
+
+## 开发
+
+```sh
+npm test                                      # node --test（132 个用例）
+npm run creator:status                        # 各 creator 的缓存状态（含 commit）
+npm run creator:refresh                       # 强制拉取最新 creator
+node scripts/audit-skill.mjs <skill-dir>      # 用 creator 自带的 validate-skill.sh 审一个技能包
+node scripts/recover-runs.mjs                 # 从会话日志重建创建记录（幂等，可加 --dry-run）
 ```
 
-发布包内保留的 npm script 只有那些**在 tarball 里真能跑**的（当前无），避免安装者执行到 `Cannot find module`。
+```sh
+node bin/dsh-skill-create.mjs --mode huawei --domain computing --product ecs --name ecs-manage
+node bin/dsh-skill-validate.mjs <skill-dir> [--mode huawei|generic] [--edit]
+```
+
+`bin/dsh-skill-create.mjs` 只**打印**要交给 creator 的请求文本（创建本身由 creator 完成）。注意：它接收的 `--summary` / `--tags` 等参数当前不会被 `buildHandoff` 采用（只读 `name` / `domain` / `product` / `description` / `extra`），因此该命令产出的请求只含名称与目录信息。
+
+**发布包只含 19 个文件**（`npm pack --dry-run` 实测）：`package.json`、`README.md`、`LICENSE`、`icon.svg`、`cordis.patch.yml`、`bin/`（2 个 CLI）、`locale/`（2 个）、`src/client.js`、`src/lib/yaml.mjs`、`src/core/` 下的 8 个模块（catalog / creators / evaluator / plugin / routes / runner / spec / validators）。
+
+不随包发布：`test/`、`scripts/`（`audit-skill.mjs` / `recover-runs.mjs`）、`src/core/dsh-install.mjs`（仅作者本机安装 profile 用）、`docs/`、`contrib/`。包内 npm scripts 为 `test` / `creator:status` / `creator:refresh`，其中 `test` 的测试目录不在包里，只在仓库内有意义。
+
+## 许可与链接
+
+- **License**：MIT（见 `package.json` 的 `license` 与仓库 `LICENSE`）
+- **仓库**：https://github.com/wasteoneslife/dsh-skill-creator
+- **npm**：https://www.npmjs.com/package/@cloudplugin/dsh-skill-creator
+- **Issues**：https://github.com/wasteoneslife/dsh-skill-creator/issues
