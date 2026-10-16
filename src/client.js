@@ -31,9 +31,9 @@ window.__ModuleLoader__.load({
     // `api` is a declared placeholder: it renders one description form and scopes the
     // creation records, exactly like the generic category.
     const MODES = [
-      ['generic', '通用技能'],
-      ['api', '标准API管理技能'],
-      ['huawei', '华为云基础云服务技能'],
+      ['generic', '通用技能', 'common-skill-dev'],
+      ['api', '标准API管理技能', 'common-restapi-skill-dev'],
+      ['huawei', '华为云基础云服务技能', 'huawei-skill'],
     ];
     const MODE_LABEL = { generic: '通用技能', api: '标准API管理技能', huawei: '华为云基础云服务技能' };
     /** The category selected on open: the first menu item (通用技能). */
@@ -66,7 +66,7 @@ window.__ModuleLoader__.load({
 
     // The records card shows five creations before scrolling: a longer history would push
     // the requirements form below the fold on this page.
-    const RECORDS_VISIBLE = 5;
+    const RECORDS_VISIBLE = 3;   // 视口只露出三条，其余在卡片内滚动
     const RECORD_ROW_HEIGHT = 30;
 
     const T = {
@@ -126,6 +126,14 @@ window.__ModuleLoader__.load({
     // spreading undefined silently yields {}, so they rendered with a min height and no
     // border/background of their own. Defined here (after T) so it can reuse `input`.
     T.prompt = { ...T.input, minHeight: 140, resize: 'vertical', lineHeight: 1.5 };
+
+    // 菜单项第二行的说明小字（如 common-skill-dev）
+    T.menuSub = { fontSize: 10.5, lineHeight: 1.25, color: 'var(--dsw-alias-label-secondary)', fontWeight: 400 };
+
+    // 三级目录共用一行：三项等宽平分（flex 1 1 0 覆盖 cell 的 width:100%，
+    // 因此它们不会被“整行字段”的检测规则计入，其余控件仍是一行一个。）
+    T.taxRow = { display: 'flex', flexDirection: 'row', gap: 8, width: '100%', alignItems: 'flex-end' };
+    T.taxCell = { flex: '1 1 0', minWidth: 0, width: 'auto' };
     T.nameInput = { ...T.input, borderRadius: '0 8px 8px 0' };
 
     // Called as Field(props, child): the control arrives as the second positional argument.
@@ -352,13 +360,13 @@ window.__ModuleLoader__.load({
         h('div', { style: T.shell },
           !run && h('nav', { style: T.menu, 'aria-label': '技能类型' },
             h('div', { style: T.label }, '技能类型'),
-            ...MODES.map(([value, label]) => h('button', {
+            ...MODES.map(([value, label, sub]) => h('button', {
               key: value, type: 'button', 'data-mode': value,
               'data-active': mode === value ? '1' : undefined,
               'aria-current': mode === value ? 'true' : undefined,
-              style: { ...T.menuItem, ...(mode === value ? T.menuItemActive : {}) },
+              style: { ...T.menuItem, display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 1, ...(mode === value ? T.menuItemActive : {}) },
               onClick: () => setMode(value),
-            }, label))),
+            }, h('span', null, label), h('span', { style: T.menuSub }, sub)))),
           h('div', { style: T.content },
 
         // Which creator runs, and the live run state.
@@ -458,13 +466,13 @@ window.__ModuleLoader__.load({
             `（暂无${MODE_LABEL[mode] || mode} 创建记录）`)]))),
 
         // Requirements form (only while nothing is running).
-        !run && mode === 'huawei' && h('div', { style: T.row },
-          Field({ label: '一级目录（固定根）' },
+        !run && mode === 'huawei' && h('div', { style: T.taxRow, 'data-taxonomy': '1' },
+          Field({ label: '一级目录（固定根）', style: T.taxCell },
             Select({ value: CATALOG_ROOT, disabled: true, title: '仓库根目录，固定' },
               h('option', { key: CATALOG_ROOT, value: CATALOG_ROOT }, CATALOG_ROOT))),
-          Field({ label: '二级目录（一级下读取）' },
+          Field({ label: '二级目录（一级下读取）', style: T.taxCell },
             Select({ value: domain, onChange: (e) => setDomain(e.target.value) }, options(domains, '（无子目录）'))),
-          Field({ label: '三级目录（二级下读取）' },
+          Field({ label: '三级目录（二级下读取）', style: T.taxCell },
             Select({ value: product, onChange: (e) => setProduct(e.target.value) }, options(products, '（无子目录）')))),
         // Generic/API modes have NO name field and no taxonomy: one description is the form.
         !run && mode === 'huawei' && Field({ label: '技能名 name（前缀固定）' },

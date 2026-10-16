@@ -73,6 +73,7 @@ Client 侧：`src/client.js`，通过 `window.__ModuleLoader__.load({ id })` 注
 ## 3. 三种模式
 
 模式选择在**侧边栏菜单**里（不是顶部 radio 按钮）。**菜单顺序即列表顺序，华为云在最后**；默认选中**通用技能**。
+每一项下方有一行说明小字，标明该分类对应的 creator 家族：**通用技能** `common-skill-dev` / **标准API管理技能** `common-restapi-skill-dev` / **华为云基础云服务技能** `huawei-skill`。
 
 | 内部 mode 键（API 契约，未变） | 显示名 | 委托的官方 creator | 来源仓库 |
 | --- | --- | --- | --- |
@@ -140,20 +141,21 @@ Client 侧：`src/client.js`，通过 `window.__ModuleLoader__.load({ id })` 注
 | 维度 | 分值 | 构成 |
 | --- | --- | --- |
 | 稳定性 | 4 | 功能可用 3 + 触发词充足度 1 |
-| 成本 | 1 | 与基线比较 |
+| 成本 | 1 | 绝对上限 + （第 2 轮起）与基线比较 |
 | 效率 | 2 | 8 个子项 × 0.25（时间、工具失败、重试、cli/sdk/api/LLM 调用等） |
 | 安全 | 3 | 安全扫描 |
 
 有几条计分规则会显著影响你看到的分数，需要提前知道：
 
-- **容差 10%，且是单向的**：只对超支扣分；比基线更省永远是满分。
-- **首轮即基线**：没有既有基线时，成本与效率在首轮**自动满分**，因此首轮更容易跨过 8.5。反过来说，**首轮分数偏松**。
-- **只跑只读用例**：仅执行 `templates/test-vars.json` 中 `type=readonly|syntax` 的用例；写操作、创建 / 删除资源的用例一律不跑。
-- **口径照搬平台**：评分项与口径沿用 `skill-verify-leader` 的 `EVAL_ITEMS` / `scorer` / `gate_signals`，属于「同口径不同源」。
+- **容差 10%，且是单向的**：只对超支扣分；比基线更省永远是满分。但从**第 2 轮起**才与基线比较。
+- **绝对上限始终生效**：`evalTokenBudget`(50000) / `evalDurationCapSeconds`(600) / `evalMaxToolCalls`(20) / `evalMaxLlmCalls`(20) / cli·sdk·api(20) / 工具失败与重试必须为 0。首轮没有基线时按绝对上限判定——**首轮不再自动满分**；有基线时"≤ 基线×1.1"与"≤ 绝对上限"同时满足才满分。
+- **功能可用靠 skill 自带夹具的证据**：必须真实执行 ≥ `minFixtureCases`(3) 条自带夹具用例，每条带命令 + 观测结果 + 与期望的对比结论，且无 fail；只有评测 agent 自编用例（或夹具不存在）→ 这 3 分为 0。
+- **本地门禁**：SKILL.md/frontmatter、该 kind 的夹具存在且可解析、结构校验 error 为 0、华为云 creator 的 `validate-skill.sh` 无 FAIL；任一不过 → 总分 ≤ `gateScoreCap`(7.0)，必然低于 8.5 并回传修改。
+- **只跑只读用例**：按 kind 取自带夹具（华为云/标准API：`templates/test-vars.json`；通用：`evals/evals.json`）里的只读/语法用例；写操作、创建 / 删除资源的用例一律不跑。
+- **口径照搬平台**：评分项、权重与容差沿用 `skill-verify-leader` 的 `EVAL_ITEMS` / `scorer`；差别在**输入**（平台用数据库基线 + 外部门禁，本地面板用绝对上限 + 本地门禁）与**来源**。
 - **未纳入项**：平台特有的外部门禁扣分、CodeArts / Hermes 运行时导出**未纳入**评测；报告里会明确标注「未纳入（平台侧信号缺失）」。这是有意的标注，不是功能缺失。
 - **无提升早停**：修复轮的提升 < 0.2 即停止（阈值可由 `minImprovement` 配置）。
 - **通过后界面只显示「✅ 通过」**，不再显示轮次。
-- 评测轮**没有单轮 token 预算**。
 
 ## 6. 无人值守与健壮性
 
@@ -188,6 +190,15 @@ Client 侧：`src/client.js`，通过 `window.__ModuleLoader__.load({ id })` 注
 | `passScore` | `8.5` | 通过线 |
 | `maxEvalRounds` | `3` | 最大评测轮数 |
 | `evalReadonlyOnly` | `true` | 只跑只读 / 语法用例 |
+| `evalTokenBudget` | `50000` | 单轮 token 上限（无基线时按它判定成本分） |
+| `evalDurationCapSeconds` | `600` | 单轮时长上限（秒） |
+| `evalMaxToolCalls` | `20` | 单轮工具调用总量上限 |
+| `evalMaxLlmCalls` | `20` | 单轮 LLM 轮次上限 |
+| `evalMaxCliCalls`/`evalMaxSdkCalls`/`evalMaxApiCalls` | `20` | 分类调用次数上限 |
+| `evalMaxToolFailures`/`evalMaxRetries` | `0` | 工具失败、重试的绝对要求 |
+| `minFixtureCases` | `3` | 功能可用至少执行的夹具用例数 |
+| `gateScoreCap` | `7.0` | 门禁不过时的总分上限 |
+| `strictStructureGate` | `false` | 是否把华为云结构规则套到所有 kind |
 | `idleTimeoutMs` | `480000` | 静默看门狗（8 分钟无活动判死） |
 | `phaseTimeoutMs` | `7200000` | 整段绝对兜底（120 分钟） |
 | `minImprovement` | — | 无提升早停阈值；修复轮提升低于该值即停止 |
@@ -208,13 +219,13 @@ Client 侧：`src/client.js`，通过 `window.__ModuleLoader__.load({ id })` 注
 - **不创造 Skill 内容**：内容由官方 creator 产出。
 - **不做平台流水线的事**：不建 PR、不交棒。
 - **评测是同口径不同源**，不等价于平台门禁结论。
-- **首轮成本 / 效率自动满分，使首轮偏松**。
-- **评测轮没有单轮 token 预算**。
+- **评分输入与平台不同**：平台相对于数据库基线并叠加外部门禁；本面板没有基线，改用绝对上限（`eval*` 键）+ 本地确定性门禁。
+- **有单轮预算**：token / 时长 / 调用次数超上限，或任一本地门禁不过 → 总分被压到 7.0 以下，一定低于通过线并回传修改。
 
 ## 10. 质量数据
 
-- 测试 **132 项全绿**。
-- **三种模式端到端实跑通过，均首轮 10/10 达标、零提问、零错误**：
+- 测试 **162 项全绿**。
+- **三种模式端到端实跑通过，均首轮 10/10 达标、零提问、零错误**（数据取自改造前：当时首轮成本/效率白送、且没有本地门禁；改造后同样的产物会按绝对上限 + 夹具证据 + 门禁重新判定）：
 
 | 模式 | Skill |
 | --- | --- |

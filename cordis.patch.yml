@@ -1,4 +1,4 @@
-﻿# @cloudplugin/dsh-skill-creator — bundle patch (inserted rows)
+# @cloudplugin/dsh-skill-creator — bundle patch (inserted rows)
 # All in-process; there is no child engine and no listening port:
 #   Host  : registers the official creator skills (ctx.skills.registerProvider) and the
 #           panel API (ctx.webServer), and runs the creation flow by driving an agent
@@ -57,6 +57,37 @@
           # 评测只跑 templates/test-vars.json 里 type=readonly|syntax 的用例，
           # 写操作一律不跑（false 才放开，不建议）。
           evalReadonlyOnly: true
+          # ── 成本/效率的绝对上限（首轮不再白送）────────────────────────────
+          # 平台分数是"相对数据库基线 + 外部门禁"；本地面板两者都没有，照搬公式会让
+          # 首轮的成本(1)+效率(2) 恒为满分（实测三次运行都是 10.00/10，8.5 通过线形同虚设）。
+          # 现在始终按绝对上限判定；有基线时"≤ 基线×(1+10%)"与"≤ 绝对上限"同时成立才满分。
+          # 默认值依据实测量级：评测轮 token 23965/28550/38999/39617、时长
+          # 42.5/58.2/65.75/394.1 s、工具调用 4-8、cli 2-6、llm 4-6、工具失败 0、重试 0。
+          evalTokenBudget: 50000          # 单轮 token 上限（input+output）
+          evalDurationCapSeconds: 600     # 单轮墙钟时长上限（秒）
+          evalMaxToolCalls: 20            # 单轮工具调用总量上限（cli/sdk/api 分类项共享该上限）
+          evalMaxLlmCalls: 20             # 单轮 LLM（assistant）轮次上限
+          evalMaxCliCalls: 20             # cli / sdk / api 分类调用次数上限
+          evalMaxSdkCalls: 20
+          evalMaxApiCalls: 20
+          evalMaxToolFailures: 0          # 工具失败必须为 0（绝对要求，不受容差保护）
+          evalMaxRetries: 0               # 重试必须为 0（绝对要求，不受容差保护）
+          # ── 夹具证据（功能可用 3 分的唯一依据）与本地门禁 ────────────────
+          # 评测 agent 自编的用例不能支撑「功能可用」：必须真实执行 skill 自带夹具
+          # （huawei/api: templates/test-vars.json；generic: evals/evals.json）至少这么多条，
+          # 每条带执行命令 + 观测结果 + 与期望的对比结论，且没有 fail。
+          minFixtureCases: 3
+          # 任一本地门禁不过（SKILL.md/frontmatter、该 kind 的夹具、结构校验 error、
+          # 华为云 creator 的 validate-skill.sh）→ 总分压到该上限，确保 verdict 非 pass。
+          gateScoreCap: 7.0
+          # true = 把华为云仓库的结构规则逐条套到所有 kind（api 的 requirements.txt、
+          # generic 的 evals/ 会被判成 error）。默认 false：按 kind 取规则。
+          strictStructureGate: false
           # 静默阈值（无任何活动才判死）与整段绝对兜底
           idleTimeoutMs: 480000
           phaseTimeoutMs: 7200000
+          # 等待「工具调用返回」的专用上限（默认 20 分钟）。工具在飞的时候 agent 完全不产生
+          # assistant 帧：`job_output wait=true timeout_ms=600000` 就是 10 分钟合法静默，旧规则
+          # 按 idleTimeoutMs(8 分钟) 把它当卡死、杀掉健康的 run。有此键后，"既没有待决工具、
+          # 也没有新帧"才算静默；超时才判死并报「等待工具 <名> 返回超时」。
+          toolWaitMs: 1200000

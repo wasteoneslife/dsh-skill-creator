@@ -47,6 +47,10 @@
 - 后续补了一个缺陷修复：字段改名遗漏（`severity` → `level`）。该 bug 的后果是**评测 agent 没有结论时白送 3 分**——属于「沉默即通过」的错误，方向性比数值错误更危险。
 - 增加**无提升早停**，避免在明显收敛不了的修复轮上继续烧时间。
 - 通过后界面只显示「**通过**」，不再显示轮次，减少无关噪声。
+- **阶段 3 修订（评分口径照搬导致的常数化）**：平台那个分数是「相对数据库基线 + 外部门禁」，本地面板两者都没有，照搬公式的后果是首轮成本(1)+效率(2) 恒为满分、`passScore 8.5` 形同虚设（三次真实运行都是 10.00/10，修复闭环一次都没触发）。修订为：
+  1. 成本/效率**始终**适用绝对上限（`evalTokenBudget`/`evalDurationCapSeconds`/`evalMaxToolCalls`/`evalMaxLlmCalls`/cli·sdk·api 上限，工具失败与重试绝对为 0），有基线时再叠加「≤ 基线×1.1」，更省不罚；
+  2. 「功能可用」改用**外部证据**：必须真实执行被测 skill 自带夹具（huawei/api `templates/test-vars.json`、generic `evals/evals.json`）≥ `minFixtureCases` 条并逐条给出命令+观测+对比结论，评测 agent 自编用例不再构成达标依据；
+  3. 加回一组**本地确定性门禁**（SKILL.md/frontmatter、夹具存在且可解析、结构校验 error=0、华为云 creator 的 `validate-skill.sh` 无 FAIL），任一不过 → 总分上限 `gateScoreCap`(7.0) 且 `verdict !== 'pass'`，扣分明细/修复提示词/报告里都列出。
 
 ## 6. 阶段 4：无人值守与健壮性
 
@@ -156,7 +160,18 @@ npm 版本线：**0.0.1 → 0.0.2 → 包名一度改为 `@cloudplugin/scenes-sk
 ## 13. 现状
 
 - 版本：`@cloudplugin/dsh-skill-creator@0.0.3`（npm 已发布 0.0.2，0.0.3（已发布）；显示标题 Scenes Skill Creator）。
-- 测试：**132 项全绿**。
+- 测试：**162 项全绿**。
 - 三种模式端到端实跑通过，均**首轮 10/10 达标、零提问、零错误**：`huawei-cloud-mrs-manage`（华为云）、`markdown-notes-index`（通用技能）、`jsonplaceholder-posts`（标准API）。
+- 侧边栏菜单每项为两行：显示名 + 说明小字（`common-skill-dev` / `common-restapi-skill-dev` / `huawei-skill`）。
 
 相关文档：`docs/introduction-zh.md`（使用说明）、`docs/development-zh.md`（本文档）。
+
+
+## 维护者命令（从 README 移出）
+
+以下命令用于仓库维护，**不随 npm 包发布**，故不放在对外的 README 里：
+
+```bash
+node scripts/recover-runs.mjs                 # 从会话日志重建创建记录（幂等，可加 --dry-run）
+node scripts/audit-skill.mjs <skill-dir>      # 用 creator 自带的 validate-skill.sh 审一个技能包
+```

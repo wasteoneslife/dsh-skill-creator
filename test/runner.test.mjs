@@ -4,8 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { CREATORS, cacheRoot, creatorDir } from '../src/core/creators.mjs';
-import { scoreEvaluation } from '../src/core/evaluator.mjs';
-import { createRunner, createUserMessage, detectPhase, detectStage, phasesFor, summarizeToolCall, PHASES } from '../src/core/runner.mjs';
+import { EVAL_RESULT_CLOSE, EVAL_RESULT_OPEN, scoreEvaluation } from '../src/core/evaluator.mjs';
+import { createRunner, createUserMessage, detectPhase, detectStage, phasesFor, runCreatorValidator, summarizeToolCall, PHASES } from '../src/core/runner.mjs';
 
 // Seed a fresh creator cache so start() never needs the network.
 process.env.DSH_SKILL_CREATOR_CACHE = fs.mkdtempSync(path.join(os.tmpdir(), 'dsc-runner-'));
@@ -572,9 +572,239 @@ describe('runner · 评测与修复循环', () => {
     assert.equal(snap.status, 'below-threshold', 'a broken package cannot pass on a prose-only verdict');
     assert.ok(snap.checks.structuralErrors >= 1, 'the validator reports level:"error" issues');
     assert.equal(snap.checks.functionalUsable, false, 'no verdict must NOT default to full marks');
-    assert.match(snap.checks.functionalEvidence, /改用本地结构校验/);
+    // The old fallback ("no verdict ⇒ trust the structure validator") handed out the 3
+    // functional points; the evidence must now say the fixture was never executed.
+    assert.match(snap.checks.functionalEvidence, /用例实际执行 0 条/);
+    assert.match(snap.checks.functionalEvidence, /不再替代功能证据/);
     assert.equal(snap.itemScores.find((i) => i.itemName === '功能可用').score, 0);
+    // and the local gates must call out the two broken constraints
+    const failed = snap.checks.gates.filter((g) => g.ok === false).map((g) => g.id);
+    assert.deepEqual(failed.sort(), ['skill-md', 'structure'], JSON.stringify(snap.checks.gates));
     assert.ok(snap.score < snap.passScore, 'score ' + snap.score + ' must stay below ' + snap.passScore);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // ── 看门狗：等待工具 ≠ 静默（生产缺陷：job_output 10 分钟超时被 8 分钟静默判死）────
+  test('看门狗：等待工具未超时 → tool-wait（不判死）；超过 toolWaitMs 才 idle 并点名工具', () => {
+    const base = { startedAt: 0, idlePollMs: 15000, idleTimeoutMs: 480000, phaseTimeoutMs: 7200000 };
+    // 工具已等待 9 分钟：远超 idleTimeoutMs(8 分钟)，但仍在 toolWaitMs(20 分钟) 内 → 继续等。
+    // pendingToolAt = 0（时间戳的合法值）同时钉住"0 不能被当成没有待决工具"。
+    const waiting = { ...base, now: 540000, lastTick: 525000, lastActivityAt: 0, pendingToolAt: 0, pendingToolName: 'job_output' };
+    const held = watchdogDecision({ ...waiting, toolWaitMs: 1200000 });
+    assert.equal(held.action, 'tool-wait', '工具在飞且未超上限，绝不能按静默判死');
+    assert.equal(held.waitedMs, 540000);
+    assert.equal(held.toolName, 'job_output');
+    // 同一个 9 分钟的等待，专用上限缩到 5 分钟 → 越界，必须判死并点名工具
+    const blown = watchdogDecision({ ...waiting, toolWaitMs: 300000 });
+    assert.equal(blown.action, 'idle');
+    assert.equal(blown.waitedOnTool, true);
+    assert.equal(blown.toolName, 'job_output');
+  });
+
+  test('看门狗：没有待决工具时静默语义不变（无活动 9 分钟 → idle）', () => {
+    const base = { startedAt: 0, idlePollMs: 15000, idleTimeoutMs: 480000, phaseTimeoutMs: 7200000, toolWaitMs: 1200000 };
+    // 显式 null = 没有工具在飞：这一刻的 9 分钟沉默仍然是卡死
+    const verdict = watchdogDecision({ ...base, now: 540000, lastTick: 525000, lastActivityAt: 0, pendingToolAt: null });
+    assert.equal(verdict.action, 'idle');
+    assert.equal(verdict.waitedOnTool, undefined, '没有待决工具时不能走"等待工具超时"这条路');
+    // 刚活动过 → 继续等（原语义）
+    assert.equal(watchdogDecision({ ...base, now: 30000, lastTick: 15000, lastActivityAt: 20000, pendingToolAt: null }).action, 'ok');
+  });
+
+  test('看门狗：机器休眠优先级最高——即使同时有等待中的工具也判 suspend；整段兜底仍是兜底', () => {
+    // 这一跳（2.5 小时）是挂起，不是卡死；工具等待绝不允许把它降级成 idle。
+    // pendingToolAt = 0 且 toolWaitMs 只有 20 分钟：若无 suspend 优先，这里必然变成 idle。
+    assert.equal(watchdogDecision({
+      startedAt: 0, idlePollMs: 15000, idleTimeoutMs: 480000, phaseTimeoutMs: 7200000, toolWaitMs: 1200000,
+      now: 9000000, lastTick: 0, lastActivityAt: 0, pendingToolAt: 0, pendingToolName: 'job_output',
+    }).action, 'suspend');
+    // 工具在飞（刚等 10 秒）但整段已超过 phaseTimeoutMs → phase 依旧兜底，不被 tool-wait 无限延长
+    assert.equal(watchdogDecision({
+      startedAt: 0, idlePollMs: 15000, idleTimeoutMs: 480000, phaseTimeoutMs: 7200000, toolWaitMs: 1200000,
+      now: 7300000, lastTick: 7290000, lastActivityAt: 7290000, pendingToolAt: 7290000,
+    }).action, 'phase');
+  });
+
+  test('状态机：等待长工具返回期间 run 不被判死，工具返回后第一帧清除待决标记', async () => {
+    const { ctx, agents, emit } = fakeCtx();
+    // idleTimeoutMs 150ms 远小于下面的观察窗口 ~300ms：纯静默早就该判死了
+    const runner = createRunner(ctx, {
+      wakeGraceMs: 0, persistDebounceMs: 0, maxEvalRounds: 0,
+      idleTimeoutMs: 150, idlePollMs: 25, toolWaitMs: 30000, phaseTimeoutMs: 600000,
+    });
+    const run = await runner.start(SPEC);
+    emit(agents[0], { type: 'start', turn: 1, step: 1 });
+    // agent 提交工具调用后不再产生任何帧——这正是 job_output wait=true timeout_ms=600000 的样子
+    emit(agents[0], { type: 'chunk', chunk: { type: 'block-end', block: { type: 'tool-call', name: 'job_output', arguments: '{"job_id":"pwsh-170","wait":true,"timeout_ms":600000}' } } });
+    const live = runner.runs.get(run.id);
+    assert.equal(live.pendingToolName, 'job_output', '已派发的工具必须被记住（便于诊断）');
+    assert.ok(live.pendingToolAt > 0, '必须记下开始等待的时刻');
+
+    await settle(30);                        // ~300ms 无帧：是 idleTimeoutMs 的两倍
+    const snap = runner.get(run.id);
+    assert.equal(snap.error, '');
+    assert.equal(snap.status, 'creating', `等待工具期间不得判死：${snap.error}`);
+
+    // 工具返回 → agent 继续产生帧 → 待决标记立刻清除（之后的静默重新按 idleTimeoutMs 算）
+    emit(agents[0], { type: 'chunk', chunk: { type: 'text-delta', text: '工具返回了，继续 Phase 3' } });
+    assert.equal(runner.runs.get(run.id).pendingToolAt, null);
+    assert.equal(runner.runs.get(run.id).pendingToolName, null);
+    await settle(2);
+    assert.equal(runner.get(run.id).status, 'creating');
+  });
+
+  test('状态机：等待工具超过 toolWaitMs 才判死，错误信息报「等待工具 <名> 返回超时」', async () => {
+    const { ctx, agents, emit } = fakeCtx();
+    const runner = createRunner(ctx, {
+      wakeGraceMs: 0, persistDebounceMs: 0, maxEvalRounds: 0,
+      idleTimeoutMs: 100, idlePollMs: 20, toolWaitMs: 400, phaseTimeoutMs: 600000,
+    });
+    const run = await runner.start(SPEC);
+    emit(agents[0], { type: 'start', turn: 1, step: 1 });
+    emit(agents[0], { type: 'chunk', chunk: { type: 'block-end', block: { type: 'tool-call', name: 'job_output', arguments: '{"wait":true}' } } });
+
+    // 已越过 idleTimeoutMs(100ms) 但仍在 toolWaitMs(400ms) 内：不许判死
+    const until = Date.now() + 220;
+    while (Date.now() < until) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(runner.get(run.id).status, 'creating', '工具上限之内不得判死（改坏 tool-wait 时这里变红）');
+
+    // 越过上限：必须判死，而且错误信息要点名是哪个工具
+    for (let i = 0; i < 120 && runner.get(run.id).status !== 'failed'; i++) await new Promise((r) => setTimeout(r, 20));
+    const snap = runner.get(run.id);
+    assert.equal(snap.status, 'failed');
+    assert.match(snap.error, /等待工具 job_output 返回超时/);
+  });
+
+  // ── 改造 A/B/E 的端到端组合：门禁 + 夹具证据决定 8.5 能否通过 ────────────────
+  /**
+   * Drive one REAL evaluation round (the evaluateWithAgent path, not the `runEvaluation`
+   * seam): the creator "writes" a generic skill into `<cwd>/skills/<name>`, the evaluation
+   * agent answers with a structured JSON block, and the verdict comes from the local gates
+   * plus the fixture evidence.
+   */
+  const realEvalRound = async ({ writeSkill, evaluatorReply }) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsc-e2e-'));
+    const skillDir = path.join(dir, 'skills', 'demo-skill');
+    fs.mkdirSync(skillDir, { recursive: true });
+    writeSkill(skillDir);
+    const { ctx, agents, emit, idle } = fakeCtx();
+    // maxEvalRounds 1: the round's own verdict is what is asserted (no fix loop needed).
+    const runner = createRunner(ctx, { wakeGraceMs: 0, persistDebounceMs: 0, maxEvalRounds: 1, cwd: dir });
+    const run = await runner.start({ mode: 'generic', name: 'demo-skill', summary: 'demo skill' });
+    emit(agents[0], { type: 'start', turn: 1, step: 1 });
+    emit(agents[0], { type: 'chunk', chunk: { type: 'text-delta', text: 'Step 5 eval 迭代完成' } });
+    idle();
+    await settle(12);
+    assert.equal(agents.length, 2, '一个真实评测轮必须另起一个评测 agent');
+    emit(agents[1], { type: 'start', turn: 1, step: 1 });
+    emit(agents[1], { type: 'chunk', chunk: { type: 'text-delta', text: evaluatorReply } });
+    idle();
+    await settle(12);
+    const snap = runner.get(run.id);
+    fs.rmSync(dir, { recursive: true, force: true });
+    return snap;
+  };
+  const reply = (payload) => `${EVAL_RESULT_OPEN}\n${JSON.stringify(payload)}\n${EVAL_RESULT_CLOSE}`;
+  const SKILL_MD = [
+    '---',
+    'name: demo-skill',
+    'description: "A demo skill. Triggers include: \'demo one\', \'demo two\', \'demo three\', \'演示四\'"',
+    '---',
+    '',
+    '# Demo skill',
+    '',
+    'Run `python3 scripts/demo.py`.',
+    '',
+  ].join('\n');
+  const selfAuthoredOnly = [
+    { id: 'S-1', fixture: false, command: 'python3 scripts/demo.py --help', status: 'pass', evidence: 'exit 0 | usage: demo.py' },
+    { id: 'S-2', fixture: false, command: 'bash -n scripts/demo.sh', status: 'pass', evidence: 'exit 0' },
+    { id: 'S-3', fixture: false, command: 'python3 scripts/demo.py demo-one', status: 'pass', evidence: 'exit 0 | ok' },
+  ];
+  const fixtureEvidence = (ids) => ids.map((id) => ({
+    id, fixture: true, command: `python3 scripts/demo.py ${id}`, status: 'pass',
+    evidence: `exit 0 | {"case":"${id}"} — 与期望输出一致`,
+  }));
+
+  test('端到端：结构合规但缺夹具 → 门禁压分，total < 8.5 且 verdict 非 pass', async () => {
+    const snap = await realEvalRound({
+      writeSkill: (skillDir) => fs.writeFileSync(path.join(skillDir, 'SKILL.md'), SKILL_MD),
+      // the evaluation agent claims everything passed — with its OWN cases only
+      evaluatorReply: reply({ functionalUsable: true, triggerSufficiency: 1, cases: selfAuthoredOnly, notes: '自编用例全部通过' }),
+    });
+    const gates = Object.fromEntries(snap.checks.gates.map((gate) => [gate.id, gate.ok]));
+    assert.equal(gates['skill-md'], true);
+    assert.equal(gates.structure, true, 'generic 的 evals/ 布局不应被华为云顶层规则判错');
+    assert.equal(gates.fixtures, false, '缺 evals/evals.json → 夹具门禁失败');
+    assert.equal(snap.checks.functionalUsable, false, '自编用例不能支撑功能可用');
+    assert.match(snap.checks.functionalEvidence, /无 skill 夹具证据/);
+    assert.equal(snap.itemScores.find((item) => item.itemName === '功能可用').score, 0);
+    assert.ok(snap.score < 8.5, `门禁后总分必须低于通过线，实际 ${snap.score}`);
+    assert.notEqual(snap.verdict, 'pass');
+    assert.equal(snap.status, 'below-threshold');
+    assert.ok(snap.steps.some((step) => step.kind === 'error' && /本地门禁 fixtures 未通过/.test(step.text)),
+      JSON.stringify(snap.steps.map((step) => step.text).slice(-6)));
+    assert.match(snap.report, /## 本地门禁（任一不过 → 总分上限 7）/);
+  });
+
+  test('端到端：齐全且夹具用例全部执行带证据 → ≥ 8.5 / pass', async () => {
+    const snap = await realEvalRound({
+      writeSkill: (skillDir) => {
+        fs.writeFileSync(path.join(skillDir, 'SKILL.md'), SKILL_MD);
+        fs.mkdirSync(path.join(skillDir, 'evals'), { recursive: true });
+        fs.writeFileSync(path.join(skillDir, 'evals', 'evals.json'), JSON.stringify({
+          skill_name: 'demo-skill',
+          evals: [
+            { id: 1, prompt: '跑 demo one', expected_output: '一次成功的演示输出', files: [], assertions: ['退出码 0'] },
+            { id: 2, prompt: '跑 demo two', expected_output: '第二次演示输出', files: [] },
+            { id: 3, prompt: '跑 demo three', expected_output: '第三次演示输出', files: [] },
+          ],
+        }));
+      },
+      evaluatorReply: reply({ functionalUsable: true, triggerSufficiency: 1, cases: fixtureEvidence(['1', '2', '3']), notes: '夹具用例全过' }),
+    });
+    assert.equal(snap.checks.functionalUsable, true);
+    assert.match(snap.checks.functionalEvidence, /已执行且带证据/);
+    assert.equal(snap.itemScores.find((item) => item.itemName === '功能可用').score, 3);
+    assert.deepEqual(snap.checks.gates.filter((gate) => gate.ok === false), [], JSON.stringify(snap.checks.gates));
+    assert.equal(snap.verdict, 'pass');
+    assert.equal(snap.status, 'done');
+    assert.ok(snap.score >= 8.5, `实际 ${snap.score}`);
+    assert.equal(snap.score, 10);
+  });
+
+  test('runCreatorValidator：真跑一个 FAIL 的校验脚本 → ok=false 并带 FAIL 行；没有 bash 只记 warning', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsc-validator-'));
+    const scripts = path.join(dir, 'scripts');
+    fs.mkdirSync(scripts, { recursive: true });
+    const script = path.join(scripts, 'validate-skill.sh');
+    fs.writeFileSync(script, '#!/usr/bin/env bash\necho "=== Validate ==="\necho "  FAIL: Overview section missing"\necho "  PASS: 4  FAIL: 1  WARN: 0"\nexit 1\n');
+    const noBash = runCreatorValidator({ script, skillDir: dir, candidates: [] });
+    assert.equal(noBash.ran, false);
+    assert.equal(noBash.ok, true, '跑不了 bash 不是门禁失败');
+    assert.match(noBash.detail, /bash/);
+    const failed = runCreatorValidator({ script, skillDir: dir });
+    if (failed.ran) {
+      assert.equal(failed.ok, false);
+      assert.match(failed.detail, /1 个 FAIL/);
+      assert.match(failed.detail, /Overview section missing/);
+    } else {
+      assert.equal(failed.ok, true, '本机没有 bash：只能是 warning');
+      assert.match(failed.detail, /bash/);
+    }
+    fs.writeFileSync(script, '#!/usr/bin/env bash\necho "  PASS: 12  FAIL: 0  WARN: 2"\nexit 0\n');
+    const clean = runCreatorValidator({ script, skillDir: dir });
+    assert.equal(clean.ok, true);
+    // 退出码非 0 但没有 FAIL 行（[FATAL] / 缺 python3 / 超时）：这是"跑不了"，只记 warning
+    fs.writeFileSync(script, '#!/usr/bin/env bash\necho "[FATAL] python3 not found"\nexit 2\n');
+    const broken = runCreatorValidator({ script, skillDir: dir });
+    if (broken.ran) {
+      assert.equal(broken.ok, true, '没有 FAIL 行就不能当门禁失败');
+      assert.match(broken.detail, /未能正常完成/);
+      assert.match(broken.detail, /FATAL/);
+    } else {
+      assert.equal(broken.ok, true);
+    }
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });

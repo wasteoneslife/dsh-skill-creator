@@ -24,10 +24,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { buildHandoff as defaultBuildHandoff, CREATORS, cacheRoot, fetchCreator, kindOfMode, status } from './creators.mjs';
 import {
   DEFAULT_MAX_EVAL_ROUNDS, DEFAULT_PASS_SCORE, buildEvaluationPrompt, buildFixPrompt, descriptionFromFiles,
-  AUTONOMY_DIRECTIVES, EFFICIENCY_DIRECTIVES, formatEvaluationReport, metricsFromEvents, parseEvaluationOutput, readReadonlyCases, readSkillFiles, resolveSkillDir,
+  AUTONOMY_DIRECTIVES, EFFICIENCY_DIRECTIVES, formatEvaluationReport, metricsFromEvents, parseEvaluationOutput,
+  assessFunctionalEvidence, collectFixtureCases, evaluateGates, readSkillFiles, resolveEvalLimits, resolveSkillDir,
   scanSkillSafety, scoreEvaluation, triggerSufficiencyFromDescription,
 } from './evaluator.mjs';
 import { validateSkillPackage } from './validators.mjs';
@@ -87,6 +89,15 @@ const IDLE_TIMEOUT_MS = 8 * 60 * 1000;
 /** Absolute backstop per phase, generous: a chatty-but-stuck phase still cannot run forever. */
 const PHASE_TIMEOUT_MS = 120 * 60 * 1000;
 const IDLE_POLL_MS = 15000;
+/**
+ * How long a run may wait on ONE tool call before that wait counts as stuck.
+ *
+ * A tool in flight emits NO assistant frame at all: `job_output job_id=… wait=true
+ * timeout_ms=600000` is ten deliberately silent minutes, and the silence rule above read
+ * exactly that as "stuck" and failed a healthy run at minute eight. Waiting on a tool gets
+ * its own, larger ceiling; `phaseTimeoutMs` stays the absolute per-phase backstop.
+ */
+const TOOL_WAIT_MS = 20 * 60 * 1000;
 /** Standing reply for a creator that asks a question the panel cannot show. */
 const AUTONOMY_ANSWER = [
   '无人值守模式：没有人能看到或回答你的问题，所以请不要再提问。',
@@ -97,23 +108,114 @@ const AUTONOMY_ANSWER = [
 /**
  * What the per-phase watchdog should do on one tick.
  *
- * Split out as a pure function because the interesting case — a machine suspend — cannot
- * be reproduced reliably with real timers, yet it must never be mistaken for a stuck agent:
- * a Huawei creation slept 2h33m and was failed although it then finished successfully.
+ * Split out as a pure function because the interesting cases — a machine suspend, and a run
+ * waiting on a long tool — cannot be reproduced reliably with real timers, yet neither may
+ * ever be mistaken for a stuck agent: a Huawei creation slept 2h33m and was failed although
+ * it then finished successfully, and a run waiting on `job_output wait=true timeout_ms=600000`
+ * (ten silent minutes by design) was failed at minute eight for "silence".
+ *
+ * Silence is only stuck when there is NEITHER a pending tool NOR a new frame:
+ *   suspend   → the tick itself is hours late: the process was frozen
+ *   idle      → no pending tool and no activity for idleTimeoutMs, OR a pending tool that
+ *               blew its own toolWaitMs ceiling (`waitedOnTool: true`, with `toolName`)
+ *   tool-wait → a tool call is in flight and inside its budget: keep waiting, never kill
+ *   phase     → the absolute per-phase backstop
+ *   ok        → nothing to do
  */
-export function watchdogDecision({ now, lastTick, lastActivityAt, startedAt, idleTimeoutMs, phaseTimeoutMs, idlePollMs }) {
+export function watchdogDecision({
+  now, lastTick, lastActivityAt, startedAt, idleTimeoutMs, phaseTimeoutMs, idlePollMs,
+  pendingToolAt = null, pendingToolName = null, toolWaitMs = TOOL_WAIT_MS,
+}) {
   const late = now - lastTick;
   // A tick far later than the poll interval means the process was frozen: nothing was idle.
+  // Checked FIRST, so a machine suspend outranks every other verdict — tool wait included.
   if (late > idlePollMs * 5) return { action: 'suspend', late };
   const silentMs = now - (lastActivityAt || startedAt);
+  const phaseExceeded = now - startedAt > phaseTimeoutMs;
+  // `pendingToolAt` is a timestamp, so an explicit null means "no tool in flight" (0 is a
+  // legitimate value in tests and must not read as absent).
+  if (pendingToolAt !== null) {
+    const waitedMs = now - pendingToolAt;
+    if (waitedMs > toolWaitMs) {
+      // Only the tool's own ceiling may kill a run that is waiting on it.
+      return { action: 'idle', silentMs, waitedMs, toolName: pendingToolName, waitedOnTool: true };
+    }
+    // The phase ceiling stays ABSOLUTE: waiting on a tool must not buy an unbounded extension.
+    if (phaseExceeded) return { action: 'phase', waitedMs };
+    return { action: 'tool-wait', silentMs, waitedMs, toolName: pendingToolName };
+  }
   if (silentMs > idleTimeoutMs) return { action: 'idle', silentMs };
-  if (now - startedAt > phaseTimeoutMs) return { action: 'phase' };
+  if (phaseExceeded) return { action: 'phase' };
   return { action: 'ok' };
 }
 /** Hard ceiling for one creation/evaluation phase; a stuck phase must not hang the run. */
 const EVAL_TIMEOUT_MS = 20 * 60 * 1000;
 /** Per-session event buffer used to derive the rubric's metrics. */
 const MAX_SESSION_EVENTS = 4000;
+
+/** Where to look for bash, in order: PATH first, then the usual Git-for-Windows installs. */
+const BASH_CANDIDATES = [
+  'bash',
+  'C:\\Program Files\\Git\\bin\\bash.exe',
+  'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
+  '/bin/bash',
+  '/usr/bin/bash',
+];
+
+/**
+ * E (huawei only): run the creator's OWN `scripts/validate-skill.sh -s <skill-dir>`.
+ *
+ * Output is redirected to a regular FILE rather than a pipe: in a confined sandbox a child
+ * cannot open named pipes, so `stdio: 'pipe'` fails with EPERM. `ran: false` (no bash, EPERM,
+ * timeout) is reported as a warning by `evaluateGates`, never as a gate failure — an
+ * evaluation must not be decided by whether this machine happens to have bash.
+ */
+export function runCreatorValidator({ script, skillDir, candidates = BASH_CANDIDATES, timeoutMs = 120000 } = {}) {
+  const logFile = path.join(os.tmpdir(), `dsc-validate-${randomUUID().slice(0, 8)}.log`);
+  for (const bash of candidates) {
+    let fd = null;
+    let result;
+    try {
+      fd = fs.openSync(logFile, 'w');
+      result = spawnSync(bash, [script, '-s', skillDir], {
+        stdio: ['ignore', fd, fd], timeout: timeoutMs,
+        cwd: path.dirname(path.dirname(script)),
+      });
+    } catch {
+      continue;
+    } finally {
+      if (fd !== null) { try { fs.closeSync(fd); } catch { /* already closed */ } }
+    }
+    if (result && result.error && result.error.code === 'ENOENT') continue;
+    let output = '';
+    try { output = fs.readFileSync(logFile, 'utf8'); } catch { output = `${(result && result.stdout) || ''}\n${(result && result.stderr) || ''}`; }
+    try { fs.rmSync(logFile, { force: true }); } catch { /* diagnostics only */ }
+    if (result && result.error && result.status === null) {
+      return { ran: false, ok: true, detail: `无法执行 ${bash}：${result.error.message}` };
+    }
+    const summary = (output.match(/PASS:\s*(\d+)\s+FAIL:\s*(\d+)/) || [])[2];
+    const failCount = summary !== undefined ? Number(summary) : (output.match(/FAIL:/g) || []).length;
+    const status = result ? result.status : null;
+    if (status === 0 && failCount === 0) {
+      return { ran: true, ok: true, detail: `creator validate-skill.sh 通过（FAIL 0，退出码 0）` };
+    }
+    if (failCount === 0) {
+      // Non-zero exit with no FAIL line: the script could not do its job ([FATAL] …, missing
+      // python3/git, timeout). That is "cannot run" → warning, never a gate failure.
+      const tail = String(output).trim().split('\n').slice(-1)[0].slice(0, 200);
+      return {
+        ran: false, ok: true,
+        detail: `creator validate-skill.sh 未能正常完成（退出码 ${status}，无 FAIL 行）：${tail || '(无输出)'}`,
+      };
+    }
+    const firstFails = (output.match(/FAIL:[^\n]*/g) || []).slice(0, 3).map((line) => line.trim()).join(' / ');
+    return {
+      ran: true, ok: false,
+      detail: `creator validate-skill.sh 报 ${failCount} 个 FAIL（退出码 ${status}）${firstFails ? `：${firstFails.slice(0, 300)}` : ''}`,
+    };
+  }
+  return { ran: false, ok: true, detail: '未找到可用的 bash（PATH 与常见 Git Bash 路径都没有）' };
+}
 
 /**
  * Run lifecycle states:
@@ -215,8 +317,18 @@ export function createRunner(ctx, config = {}, deps = {}) {
   const phaseTimeoutMs = Number.isFinite(config.phaseTimeoutMs) ? Number(config.phaseTimeoutMs)
     : (Number.isFinite(config.evalTimeoutMs) ? Number(config.evalTimeoutMs) : PHASE_TIMEOUT_MS);
   const idlePollMs = Number.isFinite(config.idlePollMs) ? Number(config.idlePollMs) : IDLE_POLL_MS;
+  /** Ceiling for ONE tool call in flight; larger than idleTimeoutMs because a tool is silent. */
+  const toolWaitMs = Number.isFinite(config.toolWaitMs) ? Number(config.toolWaitMs) : TOOL_WAIT_MS;
   /** A fix round that improves less than this is not worth another ~15 minutes. 0 disables. */
   const minImprovement = Number.isFinite(config.minImprovement) ? Number(config.minImprovement) : 0.2;
+  /**
+   * Absolute ceilings for cost/efficiency + the local gate cap (`config.run`, see
+   * DEFAULT_EVAL_LIMITS). Without them the first round handed out 3 of the 10 points for
+   * free and three live runs all landed on exactly 10.00/10.
+   */
+  const evalLimits = resolveEvalLimits(config);
+  /** Test seam: the creator's validate-skill.sh execution (E) without spawning bash. */
+  const runSkillValidator = deps.runSkillValidator || runCreatorValidator;
   /** Test seam: the loop's decisions are testable without spawning an evaluation agent. */
   const runEvaluation = deps.runEvaluation || evaluateWithAgent;
   let flushTimer = null;
@@ -384,6 +496,11 @@ export function createRunner(ctx, config = {}, deps = {}) {
       const finish = (result) => {
         if (settled) return;
         settled = true;
+        // This phase no longer waits on a tool, whatever the outcome: a stale flag would
+        // mask genuine silence in the next phase (the tool must have returned for the agent
+        // to be quiescent at all).
+        run.pendingToolAt = null;
+        run.pendingToolName = null;
         clearTimeout(grace);
         clearInterval(watchdog);
         run.timers.delete(grace);
@@ -402,17 +519,35 @@ export function createRunner(ctx, config = {}, deps = {}) {
       let lastTick = startedAt;
       const watchdog = setInterval(() => {
         const now = Date.now();
-        const verdict = watchdogDecision({ now, lastTick, lastActivityAt: run.lastActivityAt, startedAt, idleTimeoutMs, phaseTimeoutMs, idlePollMs });
+        const verdict = watchdogDecision({
+          now, lastTick, lastActivityAt: run.lastActivityAt, startedAt, idleTimeoutMs, phaseTimeoutMs, idlePollMs,
+          pendingToolAt: run.pendingToolAt ?? null, pendingToolName: run.pendingToolName ?? null, toolWaitMs,
+        });
         lastTick = now;
         if (verdict.action === 'suspend') {
-          // A suspend is not idleness: re-base and keep waiting.
+          // A suspend is not idleness: re-base and keep waiting. The frozen stretch must not
+          // be charged to ANY deadline, the pending tool's included — otherwise a machine
+          // that slept while a tool was in flight would be failed for "tool wait timeout"
+          // on the first tick after waking, which is the same false positive this fix removes.
           run.lastActivityAt = now;
+          if (run.pendingToolAt !== null && run.pendingToolAt !== undefined) run.pendingToolAt = now;
           log(run, 'warn', `检测到进程被挂起约 ${Math.round(verdict.late / 60000)} 分钟，重新计时（不判死）`);
           return;
         }
+        if (verdict.action === 'tool-wait') {
+          // The agent is blocked INSIDE a tool call, so it emits no frame until the tool
+          // answers: `job_output wait=true timeout_ms=600000` is ten healthy, silent minutes.
+          // Keep waiting — only the tool's own ceiling (toolWaitMs) may end this wait.
+          return;
+        }
         if (verdict.action === 'idle') {
-          finish({ ok: false, error: `等待「${label}」超时：已静默 ${Math.round(idleTimeoutMs / 60000)} 分钟（无任何工具调用或文本）`
-            + (run.pendingQuestion ? `；它最后在等待用户回答：${run.pendingQuestion}` : '') });
+          const asked = run.pendingQuestion ? `；它最后在等待用户回答：${run.pendingQuestion}` : '';
+          finish({
+            ok: false,
+            error: verdict.waitedOnTool
+              ? `等待工具 ${verdict.toolName || '(未命名)'} 返回超时：已等待 ${Math.round(verdict.waitedMs / 60000)} 分钟（上限 ${Math.round(toolWaitMs / 60000)} 分钟）${asked}`
+              : `等待「${label}」超时：已静默 ${Math.round(idleTimeoutMs / 60000)} 分钟（无任何工具调用或文本）${asked}`,
+          });
           return;
         }
         if (verdict.action === 'phase') {
@@ -429,6 +564,10 @@ export function createRunner(ctx, config = {}, deps = {}) {
   /** Observe one assistant-stream frame of one of this run's agents. */
   function observe(run, frame, agentId) {
     if (!frame) return;
+    // ANY frame is proof the agent moved on: a tool that was in flight has returned, so the
+    // "waiting on a tool" state ends here. This is what keeps the flag from outliving the call.
+    run.pendingToolAt = null;
+    run.pendingToolName = null;
     const activity = activityOf(run, agentId);
     const isCreator = activity.role === 'creator';
     // Any frame proves the loop actually started a step for our message.
@@ -467,6 +606,13 @@ export function createRunner(ctx, config = {}, deps = {}) {
     if (chunk.type === 'tool-call-delta' && activity.pendingTool) activity.pendingTool.args += chunk.argumentsDelta || '';
     if (chunk.type === 'block-end' && chunk.block && chunk.block.type === 'tool-call') {
       const summary = summarizeToolCall(chunk.block.name, chunk.block.arguments);
+      // The call is DISPATCHED, not returned: the agent stays frame-silent until the tool
+      // answers (`job_output wait=true timeout_ms=600000` = ten silent minutes), which the
+      // silence rule used to read as "stuck" and kill a healthy run. Record WHEN it started
+      // and WHICH tool it is, so the watchdog can tell "waiting on a tool" from "producing
+      // nothing" — and can name the tool if its own ceiling is ever blown.
+      run.pendingToolAt = Date.now();
+      run.pendingToolName = chunk.block.name;
       log(run, 'tool', isCreator ? summary : `评测 · ${summary}`);
             // A creator that asks anyway must not hang the run: reply with the standing policy
             // so it carries on read-only instead of waiting for an answer nobody can give.
@@ -719,8 +865,8 @@ export function createRunner(ctx, config = {}, deps = {}) {
 
       const evaluation = outcome.evaluation;
       run.evaluations.push({
-        round: run.round, total: evaluation.total, dimensions: evaluation.dimensions,
-        verdict: evaluation.verdict, deductions: evaluation.deductions, at: Date.now(),
+        round: run.round, total: evaluation.total, rawTotal: evaluation.rawTotal, dimensions: evaluation.dimensions,
+        verdict: evaluation.verdict, deductions: evaluation.deductions, gates: evaluation.gates, at: Date.now(),
       });
       run.score = evaluation.total;
       run.dimensions = evaluation.dimensions;
@@ -733,11 +879,17 @@ export function createRunner(ctx, config = {}, deps = {}) {
       log(run, evaluation.verdict === 'pass' ? 'eval-ok' : 'eval-bad',
         `第 ${run.round} 轮评测：${evaluation.total.toFixed(2)}/10 ${evaluation.verdict === 'pass' ? '✅ 达标' : '❌ 未达标'}`);
       for (const item of evaluation.deductions) log(run, 'warn', `扣分 ${item.item} -${item.points}：${item.reason}`);
+      for (const gate of (evaluation.gates || []).filter((gate) => gate.ok === false)) {
+        log(run, 'error', `本地门禁 ${gate.id} 未通过：${gate.detail}`);
+      }
+      if (evaluation.gateCapApplied) {
+        log(run, 'warn', `门禁未过 → 本轮总分从 ${Number(evaluation.rawTotal).toFixed(2)} 压到 ${evaluation.total.toFixed(2)}（上限 ${evalLimits.gateScoreCap}）`);
+      }
 
       if (evaluation.verdict === 'pass') {
         run.verdict = 'pass';
         run.status = 'done';
-        run.report = formatEvaluationReport({ run, evaluations: run.evaluations, passScore: run.passScore, maxRounds: run.maxEvalRounds });
+        run.report = formatEvaluationReport({ run, evaluations: run.evaluations, passScore: run.passScore, maxRounds: run.maxEvalRounds, gateScoreCap: evalLimits.gateScoreCap });
         log(run, 'done', `评测通过（${evaluation.total.toFixed(2)}/10，第 ${run.round} 轮）`);
         return;
       }
@@ -746,7 +898,7 @@ export function createRunner(ctx, config = {}, deps = {}) {
       if (previousScore !== null && previousScore !== undefined && evaluation.total - previousScore < minImprovement) {
         run.verdict = "below-threshold";
         run.status = "below-threshold";
-        run.report = formatEvaluationReport({ run, evaluations: run.evaluations, passScore: run.passScore, maxRounds: run.maxEvalRounds });
+        run.report = formatEvaluationReport({ run, evaluations: run.evaluations, passScore: run.passScore, maxRounds: run.maxEvalRounds, gateScoreCap: evalLimits.gateScoreCap });
         log(run, "warn", `第 ${run.round} 轮从 ${Number(previousScore).toFixed(2)} 仅提升到 ${evaluation.total.toFixed(2)}（<0.2），提前停止`);
         return;
       }
@@ -754,7 +906,7 @@ export function createRunner(ctx, config = {}, deps = {}) {
         run.verdict = 'below-threshold';
         run.status = 'below-threshold';
         run.error = `评测 ${evaluation.total.toFixed(2)}/10 低于通过线 ${run.passScore}，已达 ${run.maxEvalRounds} 轮上限`;
-        run.report = formatEvaluationReport({ run, evaluations: run.evaluations, passScore: run.passScore, maxRounds: run.maxEvalRounds });
+        run.report = formatEvaluationReport({ run, evaluations: run.evaluations, passScore: run.passScore, maxRounds: run.maxEvalRounds, gateScoreCap: evalLimits.gateScoreCap });
         log(run, 'error', run.error);
         log(run, 'info', '已生成评测报告（面板可展开查看）');
         return;
@@ -783,7 +935,10 @@ export function createRunner(ctx, config = {}, deps = {}) {
     const skillDir = run.target;
     const files = readSkillFiles(skillDir);
     const safety = scanSkillSafety(files);
-    const cases = readReadonlyCases(skillDir, { readonlyOnly: run.evalReadonlyOnly });
+    // The skill's OWN fixture — not the evaluation agent's own test cases — is the only
+    // admissible evidence for 「功能可用」 (it naturally wrote cases it knew would pass).
+    const fixture = collectFixtureCases(skillDir, run.kind, { readonlyOnly: run.evalReadonlyOnly });
+    const cases = fixture.cases;
     const { description } = descriptionFromFiles(files);
 
     let structural = null;
@@ -798,15 +953,25 @@ export function createRunner(ctx, config = {}, deps = {}) {
     const structuralErrors = structural && Array.isArray(structural.issues)
       ? structural.issues.filter((issue) => issue.level === 'error').length
       : 0;
+    // Local deterministic gates: any failure caps this round below the pass line (no agent).
+    const gates = evaluateGates({
+      kind: run.kind, files, fixture, structural, skillDir,
+      creatorDir: run.creatorDir || '', strictStructure: evalLimits.strictStructureGate,
+      runValidator: runSkillValidator,
+    });
 
     const { agent, sessionId } = await spawnAgent(run, `eval-r${round}`);
     const prompt = buildEvaluationPrompt({
       kind: run.kind, skillName: descriptionFromFiles(files).name, skillPath: skillDir,
-      cases, readonlyOnly: run.evalReadonlyOnly, creatorDir: run.creatorDir || '',
+      cases, fixture, minFixtureCases: evalLimits.minFixtureCases,
+      readonlyOnly: run.evalReadonlyOnly, creatorDir: run.creatorDir || '',
     });
     const message = createUserMessage([{ type: 'text', text: `${prompt}\n\n${EFFICIENCY_DIRECTIVES}\n\n${AUTONOMY_DIRECTIVES}` }]);
     agent.followup(message);
-    log(run, 'info', `第 ${round} 轮评测 agent 已启动（session ${sessionId}，只读用例 ${cases.length} 条）`);
+    log(run, 'info', `第 ${round} 轮评测 agent 已启动（session ${sessionId}，夹具 ${fixture.path || '(无)'} 只读用例 ${cases.length} 条）`);
+    const failedGates = gates.filter((gate) => gate.ok === false);
+    log(run, failedGates.length ? 'warn' : 'info',
+      `本地门禁：${gates.map((gate) => `${gate.id}=${gate.ok === false ? 'FAIL' : gate.enforced === false ? 'skip' : 'ok'}`).join(' ')}`);
     const settled = await waitForIdle(run, agent, `评测 agent(第 ${round} 轮)`);
 
     const activity = activityOf(run, sessionId);
@@ -814,29 +979,33 @@ export function createRunner(ctx, config = {}, deps = {}) {
     const endedAt = Date.now();
     const metrics = metricsFromEvents(run.sessionEvents.get(sessionId) || [], { startedAt, endedAt });
 
-    // Functional usability: the agent's own verdict when it produced one; otherwise the
-    // structural validator stands in (and the report says so via functionalEvidence).
-    const functionalUsable = parsed
-      ? parsed.functionalUsable
-      : (!structural || (!structural.error && structuralErrors === 0));
+    // Functional usability: the skill's fixture evidence, or nothing. There is NO fallback to
+    // "the structure validator looked fine" — that is what used to hand out 3 free points.
+    const assessed = assessFunctionalEvidence({
+      cases: parsed ? parsed.cases : [], fixture, minFixtureCases: evalLimits.minFixtureCases,
+    });
     const checks = {
-      functionalUsable,
+      functionalUsable: assessed.usable,
       functionalEvidence: parsed
-        ? `评测 agent：${parsed.cases.filter((item) => item.status === 'pass').length}/${parsed.cases.length} 条只读用例通过`
-          + (parsed.cases.some((item) => item.status === 'skipped') ? `（${parsed.cases.filter((item) => item.status === 'skipped').length} 条 skipped）` : '')
-        : `无评测 agent 结论（${settled.ok ? '未输出结构化结果' : settled.error}），改用本地结构校验：error ${structuralErrors} 项`,
+        ? assessed.evidence
+        : `无评测 agent 结构化结论（${settled.ok ? '未输出结构化结果' : settled.error}）；${assessed.evidence}`
+          + `；本地结构校验 error ${structuralErrors} 项（由本地门禁单独判定，不再替代功能证据）`,
       triggerSufficiency: parsed && parsed.triggerSufficiency !== null
         ? parsed.triggerSufficiency
         : triggerSufficiencyFromDescription(description),
       structuralErrors,
+      fixture: { kind: fixture.kind, path: fixture.path, present: fixture.present, cases: fixture.cases.length, error: fixture.error },
+      fixtureExecuted: assessed.fixtureExecuted,
+      gates,
       cases: parsed ? parsed.cases : cases,
       notes: parsed ? parsed.notes : '',
     };
     const evaluation = scoreEvaluation({
-      checks, metrics, baseline: run.baseline, safety, passScore: run.passScore,
+      checks, metrics, baseline: run.baseline, safety, passScore: run.passScore, limits: evalLimits,
     });
     run.checks = checks;
-    return { evaluation, metrics, checks, safety, cases: checks.cases, evalSessionId: sessionId };
+    run.limits = evalLimits;
+    return { evaluation, metrics, checks, safety, gates, cases: checks.cases, evalSessionId: sessionId };
   }
 
   function snapshot(run) {

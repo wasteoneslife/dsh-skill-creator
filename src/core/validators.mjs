@@ -182,7 +182,10 @@ export function validateSkillPackage(rootDir, opts = {}) {
   }
   for (const [rel, f] of files) {
     if (!/\.md$/.test(rel)) continue;
-    const links = [...f.content.matchAll(/https?:\/\/[^\s)\]>"']+/g)].map((m) => m[0]);
+    // Backticks terminate a URL too: markdown writes `` `https://host/path` ``, and without
+    // the backtick in the exclusion class the hostname came out as "host`" — not on the
+    // allow-list — so an allowed host was reported as an external link.
+    const links = [...f.content.matchAll(/https?:\/\/[^\s)\]>"'`]+/g)].map((m) => m[0]);
     for (const url of links) {
       try {
         const host = new URL(url).hostname;

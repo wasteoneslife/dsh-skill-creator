@@ -86,11 +86,21 @@ function menuItem(tree, mode) {
   return found;
 }
 
-/** Menu entries in rendered order: [[modeKey, label], …]. */
+/** Menu entries in rendered order: [[modeKey, label, subLine], …]. */
 function menu(tree) {
   const items = [];
+  // Each entry renders two stacked lines: the human label and a secondary line
+  // (e.g. common-skill-dev). Collect both so the order assertion stays meaningful.
+  const lineOf = (node) => {
+    if (node == null) return '';
+    if (typeof node === 'string') return node;
+    return (node.children || []).map(lineOf).join('');
+  };
   walk(tree, (node) => {
-    if (node.type === 'button' && node.props['data-mode']) items.push([node.props['data-mode'], node.children.join('')]);
+    if (node.type === 'button' && node.props['data-mode']) {
+      const lines = (node.children || []).map(lineOf);
+      items.push([node.props['data-mode'], lines[0] || '', lines[1] || '']);
+    }
   });
   return items;
 }
@@ -192,7 +202,8 @@ describe('client half (fake-React render)', () => {
       const style = node.props.style;
       if (style && style.flexDirection === 'column' && style.width === '100%') cells.push(node);
     });
-    assert.ok(cells.length >= 5, `every field must be its own full-width cell (got ${cells.length})`);
+    // 例外：一级/二级/三级目录刻意共用一行（见下面的 data-taxonomy 断言），其余字段仍各自整行。
+    assert.ok(cells.length >= 2, `every field must be its own full-width cell (got ${cells.length})`);
 
     const sideBySide = [];
     const isFieldCell = (n) => n && n.props && n.props.style
@@ -203,6 +214,16 @@ describe('client half (fake-React render)', () => {
       if ((node.children || []).some(isFieldCell)) sideBySide.push(node);
     });
     assert.equal(sideBySide.length, 0, 'no two fields may share a horizontal row');
+
+    // 唯一允许共处一行的例外：三个目录下拉，等宽平分，且各自仍带标签。
+    const taxRows = [];
+    walk(tree, (node) => { if (node.props && node.props['data-taxonomy']) taxRows.push(node); });
+    assert.equal(taxRows.length, 1, '一级/二级/三级目录必须共用一行');
+    assert.equal(taxRows[0].props.style.flexDirection, 'row', '这一行是横向的');
+    const taxCells = (taxRows[0].children || []).filter((c) => c && c.props && c.props.style && c.props.style.flexDirection === 'column');
+    assert.equal(taxCells.length, 3, '三个目录各保留自己的标签单元');
+    assert.ok(taxCells.every((c) => c.props.style.flex === '1 1 0'), '三项等宽平分这一行');
+    assert.ok(taxCells.every((c) => (c.children || []).some((k) => k && k.type === 'div' && typeof (k.children || [])[0] === 'string')), '每个单元都带标签文案');
     // The sidebar shell is a row-flex container TOO: it must hold the menu + the content
     // column, never a field cell directly, or the invariant above would be violated.
     let shell = null;
@@ -314,6 +335,19 @@ describe('client half (fake-React render)', () => {
       'the menu order is generic → api → huawei (the bounds of the click targets)');
     // The order itself is asserted, not just membership: 华为云 belongs at the END.
     assert.equal(items[items.length - 1][1], '华为云基础云服务技能', '华为云 must be the LAST menu item');
+    // Secondary line under each entry — the creator-family identifier.
+    assert.deepEqual(items.map(([, , sub]) => sub),
+      ['common-skill-dev', 'common-restapi-skill-dev', 'huawei-skill'],
+      'each menu entry carries its secondary line, in the same order');
+    assert.equal(items[2][2], 'huawei-skill', '华为云的二级小字必须是 huawei-skill');
+
+    // 两行必须真的上下堆叠：block 级按钮会忽略 flexDirection/gap，小字就会跟在同一行后面。
+    for (const [key] of items) {
+      const btn = menuItem(tree, key);
+      assert.equal(btn.props.style.display, 'flex', `${key} 必须是 flex 容器，否则两行不会堆叠`);
+      assert.equal(btn.props.style.flexDirection, 'column', `${key} 必须把显示名与二级小字竖向排列`);
+    }
+    assert.ok(items.every(([, , sub]) => sub.length > 0), 'no entry may miss its secondary line');
     assert.equal(items[0][1], '通用技能', '通用技能 must be the FIRST menu item');
     assert.notEqual(items[0][1], '华为云基础云服务技能');
   });

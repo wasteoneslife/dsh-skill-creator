@@ -61,7 +61,12 @@ export function parseFrontmatter(text) {
       continue;
     }
     const v = rawVal.trim();
-    if (v === '|' || v === '|-' || v === '>') { blockLines = []; i++; continue; }
+    // `|`, `|-`, `|+`, `>`, `>-`, `>+` are all block scalars. `>-` (folded + strip, what the
+    // Huawei creator emits for long descriptions) used to fall through to the plain-scalar
+    // branch, so the first indented body line hit a stray-colon parse error and the WHOLE
+    // frontmatter was rejected — which then made every body rule (required sections included)
+    // fire on an empty body. Found on a real product: skills/computing/flexus-l/…-manage.
+    if (/^[|>][-+]?$/.test(v)) { blockLines = []; i++; continue; }
     if (v.startsWith('[')) {
       const fa = FLOW_ARRAY_RE.exec(v);
       if (!fa) fail(`unterminated flow array at line ${i + 1}`);

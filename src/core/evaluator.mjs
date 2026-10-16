@@ -14,6 +14,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { parseFrontmatterLenient } from '../lib/yaml.mjs';
 
 /** Platform tolerance: cost/efficiency only punish overspend, never underspend. */
 export const TOLERANCE = 0.10;
@@ -46,6 +47,105 @@ export const EFFICIENCY_KEYS = [
 
 /** Dimensions must add up to 10 — asserted by the tests, mirrored in the panel. */
 export const DIMENSION_MAX = { stability: 4, cost: 1, efficiency: 2, security: 3 };
+
+/**
+ * Absolute ceilings for the cost/efficiency dimensions (`config.run` keys).
+ *
+ * Why they exist: the platform's cost/efficiency items are graded against a DATABASE BASELINE
+ * plus outer gates we do not have. Copying the formula without the baseline made every
+ * first-round cost/efficiency item an unconditional full mark, so three real runs scored the
+ * same 10.00/10 and the "below 8.5 → send it back" loop never fired once. Absolute ceilings
+ * give every round a falsifiable bound; the relative (baseline) comparison is kept on top of
+ * them, so round 2+ still only punishes overspending against round 1.
+ *
+ * Defaults are grounded in the observed magnitudes of three real evaluation rounds
+ * (token 23965 / 28550 / 38999 / 39617; duration 42.5 / 58.2 / 65.75 / 394.1 s;
+ * tool calls 4-8; cli 2-6; llm 4-6; tool failures 0; retries 0): every ceiling sits well
+ * above a healthy round, so they fire on runaway rounds only.
+ */
+export const DEFAULT_EVAL_LIMITS = {
+  /** One evaluation round: total (input+output) tokens. */
+  evalTokenBudget: 50000,
+  /** One evaluation round: wall-clock seconds. */
+  evalDurationCapSeconds: 600,
+  /** One evaluation round: tool calls of any kind. */
+  evalMaxToolCalls: 20,
+  /** One evaluation round: LLM (assistant) turns. */
+  evalMaxLlmCalls: 20,
+  /** Per-category call counts (cli / sdk / api). */
+  evalMaxCliCalls: 20,
+  evalMaxSdkCalls: 20,
+  evalMaxApiCalls: 20,
+  /** Absolute: a round with a failed tool call or a retry loses that item outright. */
+  evalMaxToolFailures: 0,
+  evalMaxRetries: 0,
+  /** Functional evidence: how many fixture cases must actually be executed. */
+  minFixtureCases: 3,
+  /** Any failing local gate caps the total here (below any sane pass line). */
+  gateScoreCap: 7.0,
+  /** `true` = apply the Huawei repo's structure rules to every kind, verbatim. */
+  strictStructureGate: false,
+};
+
+/** Merge `config.run` over the defaults (unknown/garbage values are ignored, never throw). */
+export function resolveEvalLimits(config = {}) {
+  const out = { ...DEFAULT_EVAL_LIMITS };
+  for (const key of Object.keys(DEFAULT_EVAL_LIMITS)) {
+    const raw = config ? config[key] : undefined;
+    if (raw === undefined || raw === null || raw === '') continue;
+    if (key === 'strictStructureGate') { if (typeof raw === 'boolean') out[key] = raw; continue; }
+    const value = Number(raw);
+    if (Number.isFinite(value) && value >= 0) out[key] = value;
+  }
+  return out;
+}
+
+/** Which absolute ceiling belongs to which efficiency item (`null` = boolean item). */
+export const EFFICIENCY_LIMITS = {
+  durationSeconds: 'evalDurationCapSeconds',
+  toolFailCount: 'evalMaxToolFailures',
+  retryCount: 'evalMaxRetries',
+  cliCallCount: 'evalMaxCliCalls',
+  sdkCallCount: 'evalMaxSdkCalls',
+  apiCallCount: 'evalMaxApiCalls',
+  llmCallCount: 'evalMaxLlmCalls',
+  contextCompressed: null,
+};
+
+/** The per-category call items that also inherit the TOTAL tool-call ceiling. */
+const TOOL_COUNT_KEYS = new Set(['cliCallCount', 'sdkCallCount', 'apiCallCount']);
+
+/**
+ * The test fixtures each creator actually writes into the skill it generates (checked against
+ * the products under `<cwd>/skills`, not guessed):
+ *   huawei  → templates/test-vars.json   (`test_cases[]`, `type: readonly|syntax|write`)
+ *             templates/test-defaults.json (fallback; request defaults, usually no cases)
+ *   api     → templates/test-vars.json   (`test_cases[]`, `category: readonly`, `method`)
+ *   generic → evals/evals.json           (`evals[]`, prompt/expected_output/files/assertions)
+ * A kind whose creator wrote none of these is recorded as "无夹具" and fails the gate —
+ * that is the point: no fixture, no functional evidence.
+ */
+export const FIXTURE_PATHS = {
+  huawei: ['templates/test-vars.json', 'templates/test-defaults.json'],
+  api: ['templates/test-vars.json'],
+  generic: ['evals/evals.json'],
+};
+
+/**
+ * Top-level entries each creator legitimately writes. The Huawei repo's rule ("2.2") only
+ * knows SKILL.md/references/scripts/templates/demo, so the other creators' own layout
+ * (api: requirements.txt; generic: evals/, assets/) is allowed here instead of being
+ * reported as a structure error. Anything else — e.g. generic leftovers `phase-N-summary.json`,
+ * which the creator's own Step 6 is supposed to delete — stays a gate failure.
+ */
+export const KIND_ALLOWED_TOP = {
+  huawei: ['SKILL.md', 'references', 'scripts', 'templates', 'demo'],
+  api: ['SKILL.md', 'references', 'scripts', 'templates', 'requirements.txt'],
+  generic: ['SKILL.md', 'references', 'scripts', 'templates', 'assets', 'evals'],
+};
+
+/** Error-level check ids whose rules are Huawei-repo-only (still reported, not gating). */
+export const NON_HUAWEI_EXEMPT_ERROR_IDS = ['top-level', 'no-external-links', 'relative-refs'];
 
 /**
  * Signals this local evaluator cannot see. They are reported, never guessed, and their
@@ -103,11 +203,18 @@ export function triggerSufficiencyFromDescription(description) {
 }
 
 /**
- * The scoring core. `checks` carries what the eval agent observed, `metrics` the run
- * counters, `baseline` the previous round's counters (null on the first round ⇒ 自基线),
- * `safety` the local rule scan. Mirrors `scorer.score()` exactly, minus platform gates.
+ * The scoring core. `checks` carries what the eval agent observed (`functionalUsable` +
+ * `checks.gates`, both decided outside: see `assessFunctionalEvidence` / `evaluateGates`),
+ * `metrics` the run counters, `baseline` the previous round's counters (null on the first
+ * round), `safety` the local rule scan, `limits` the absolute ceilings. Weights are the
+ * platform's, unchanged; what differs from the platform is the INPUT (absolute ceilings
+ * instead of a database baseline) and the local gates.
  */
-export function scoreEvaluation({ checks = {}, metrics = {}, baseline = null, safety = null, passScore = DEFAULT_PASS_SCORE } = {}) {
+export function scoreEvaluation({
+  checks = {}, metrics = {}, baseline = null, safety = null,
+  passScore = DEFAULT_PASS_SCORE, limits = null,
+} = {}) {
+  const caps = resolveEvalLimits(limits || {});
   const firstRun = baseline === null || baseline === undefined;
   const items = [];
   const deductions = [];
@@ -115,6 +222,9 @@ export function scoreEvaluation({ checks = {}, metrics = {}, baseline = null, sa
     const value = source ? Number(source[key]) : NaN;
     return Number.isFinite(value) ? value : 0;
   };
+  const capOf = (key) => Number(caps[EFFICIENCY_LIMITS[key]]);
+  /** Absolute ceiling: true when the value is within it (a ceiling of 0 means "must be 0"). */
+  const withinCap = (value, cap) => Number.isFinite(cap) && value <= cap;
   const push = (entry) => {
     items.push(entry);
     const gap = Number((entry.maxScore - entry.score).toFixed(2));
@@ -138,27 +248,50 @@ export function scoreEvaluation({ checks = {}, metrics = {}, baseline = null, sa
   });
 
   // ── 成本 1 ────────────────────────────────────────────────────────────────
-  const tokenDelta = firstRun ? 0 : metricsOf(metrics, 'tokenTotal') - metricsOf(baseline, 'tokenTotal');
+  // Absolute ceiling ALWAYS applies; the relative (baseline) rule is added from round 2.
+  const tokens = metricsOf(metrics, 'tokenTotal');
+  const tokenCap = Number(caps.evalTokenBudget);
+  const tokenAbsOk = withinCap(tokens, tokenCap);
+  const tokenRelOk = firstRun || withinTolerance(tokens, metricsOf(baseline, 'tokenTotal'));
+  const tokenDelta = firstRun ? 0 : tokens - metricsOf(baseline, 'tokenTotal');
   push({
     id: 3, category: '成本评估', dimension: 'cost', itemName: '消耗总token',
-    maxScore: 1, score: firstRun ? 1 : (withinTolerance(metricsOf(metrics, 'tokenTotal'), metricsOf(baseline, 'tokenTotal')) ? 1 : 0),
+    maxScore: 1, score: tokenAbsOk && tokenRelOk ? 1 : 0,
     detail: firstRun
-      ? `首轮即基线：${metricsOf(metrics, 'tokenTotal')} tokens`
-      : `本轮 ${metricsOf(metrics, 'tokenTotal')} vs 基线 ${metricsOf(baseline, 'tokenTotal')} tokens（容差 ${(TOLERANCE * 100).toFixed(0)}%，超出 ${tokenDelta > 0 ? `+${tokenDelta}` : tokenDelta}）`,
+      ? `${tokens} tokens / 绝对上限 ${tokenCap}${tokenAbsOk ? '（未超预算）' : ' → 超预算，首轮不再白送'}`
+      : `本轮 ${tokens} vs 基线 ${metricsOf(baseline, 'tokenTotal')} tokens（容差 ${(TOLERANCE * 100).toFixed(0)}%，超出 ${tokenDelta > 0 ? `+${tokenDelta}` : tokenDelta}）`
+        + `；绝对上限 ${tokenCap}（本轮 ${tokenAbsOk ? '未超' : '超出'}）`,
   });
 
   // ── 效率 2 = 8 × 0.25 ────────────────────────────────────────────────────
+  // Same shape as cost: absolute ceiling first, baseline comparison on top (never punishes
+  // spending less). The tool-call items additionally inherit the TOTAL tool-call ceiling:
+  // a round that fans out past `evalMaxToolCalls` has no claim to "调用次数" points.
+  const totalToolCalls = metricsOf(metrics, 'toolCalls');
+  const toolVolumeOk = withinCap(totalToolCalls, Number(caps.evalMaxToolCalls));
   RUBRIC.filter((item) => item.dimension === 'efficiency').forEach((item, index) => {
     const key = EFFICIENCY_KEYS[index];
     const current = metricsOf(metrics, key);
     const base = firstRun ? null : metricsOf(baseline, key);
-    const ok = firstRun || withinTolerance(current, base);
+    const relOk = firstRun || withinTolerance(current, base);
+    let absOk;
+    let absDetail;
+    if (EFFICIENCY_LIMITS[key] === null) {
+      absOk = Number(current) === 0;
+      absDetail = `未压缩 ${absOk ? '✅' : '❌'}（本地不可观测，按事件推断）`;
+    } else {
+      const cap = capOf(key);
+      absOk = withinCap(current, cap) && (TOOL_COUNT_KEYS.has(key) ? toolVolumeOk : true);
+      absDetail = `${key}=${current} / 上限 ${cap}`;
+      if (Number(current) > cap) absDetail += ' → 超上限';
+      if (!toolVolumeOk && TOOL_COUNT_KEYS.has(key)) absDetail += `；工具调用总量 ${totalToolCalls} 超上限 ${caps.evalMaxToolCalls}`;
+    }
     push({
       id: item.id, category: item.category, dimension: 'efficiency', itemName: item.itemName,
-      maxScore: item.maxScore, score: ok ? item.maxScore : 0,
+      maxScore: item.maxScore, score: absOk && relOk ? item.maxScore : 0,
       detail: firstRun
-        ? `首轮即基线：${key}=${current}`
-        : `${key} ${current} vs 基线 ${base}（容差 ${(TOLERANCE * 100).toFixed(0)}%）`,
+        ? `首轮无基线，按绝对上限判定：${absDetail}`
+        : `${absDetail}；基线 ${base}（容差 ${(TOLERANCE * 100).toFixed(0)}%，${relOk ? '未超支' : '超支'}）`,
     });
   });
 
@@ -173,7 +306,27 @@ export function scoreEvaluation({ checks = {}, metrics = {}, baseline = null, sa
       : '本地规则扫描未发现问题（硬编码凭据 / 写操作确认 / 跨 skill 直连）',
   });
 
-  const total = Number(items.reduce((sum, item) => sum + item.score, 0).toFixed(2));
+  // ── 本地门禁：任一不过 → 总分压到 gateScoreCap，确保 verdict !== 'pass' ──────
+  // These are deterministic, agent-free checks (SKILL.md/frontmatter, the kind's own test
+  // fixture, the local structure validator, the Huawei creator's validate-skill.sh).
+  const gates = Array.isArray(checks.gates) ? checks.gates.filter((gate) => gate && typeof gate === 'object') : [];
+  const failedGates = gates.filter((gate) => gate.ok === false);
+  const rawTotal = Number(items.reduce((sum, item) => sum + item.score, 0).toFixed(2));
+  let total = rawTotal;
+  if (failedGates.length) {
+    const cap = Number.isFinite(Number(caps.gateScoreCap)) ? Number(caps.gateScoreCap) : DEFAULT_EVAL_LIMITS.gateScoreCap;
+    if (total > cap) total = cap;
+    // The deduction row only appears when the cap actually bit; otherwise the gate failures are
+    // already listed in `gates` (report + fix prompt) and a 0-point row would just be noise.
+    if (rawTotal > total) {
+      deductions.push({
+        item: '本地门禁', dimensions: 'gates', points: Number((rawTotal - total).toFixed(2)),
+        reason: `未通过：${failedGates.map((gate) => `${gate.id}（${gate.detail || '无明细'}）`).join('；')}`
+          + `；总分上限 ${cap}`,
+      });
+    }
+  }
+  total = Number(total.toFixed(2));
   const dimensions = items.reduce((acc, item) => {
     acc[item.dimension] = Number(((acc[item.dimension] || 0) + item.score).toFixed(2));
     return acc;
@@ -181,6 +334,7 @@ export function scoreEvaluation({ checks = {}, metrics = {}, baseline = null, sa
   const pass = Number(passScore);
   return {
     total,
+    rawTotal,
     maxTotal: MAX_TOTAL,
     passScore: pass,
     firstRun,
@@ -188,6 +342,9 @@ export function scoreEvaluation({ checks = {}, metrics = {}, baseline = null, sa
     dimensions,
     items,
     deductions,
+    gates,
+    gateCapApplied: failedGates.length > 0 && total < rawTotal,
+    limits: caps,
     safety: safety || { high: 0, warnings: 0, findings: [] },
   };
 }
@@ -340,39 +497,273 @@ export function scanSkillSafety(files = {}) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Test fixtures (per kind) · functional evidence · local gates
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Parse one fixture file into the case shape this evaluator consumes. */
+function fixtureCasesFrom(parsed, rel, { readonlyOnly = true, limit = 20 } = {}) {
+  const isEvalList = Array.isArray(parsed && parsed.evals);
+  const list = isEvalList ? parsed.evals : (Array.isArray(parsed && parsed.test_cases) ? parsed.test_cases : []);
+  const cases = [];
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue;
+    if (cases.length >= limit) break;
+    const declared = String(item.type || item.category || '').toLowerCase();
+    // Write / mutating cases never reach the evaluator at all. The REST-API creator labels a
+    // case's HTTP verb in `method` (NONE/GET/…/POST/DELETE) while `category` may still say
+    // "readonly", so BOTH signals are honoured.
+    const mutating = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(String(item.method || '').toUpperCase());
+    if (readonlyOnly && declared && !['readonly', 'syntax'].includes(declared)) continue;
+    if (readonlyOnly && mutating) continue;
+    cases.push({
+      id: String(item.id ?? `TC-${cases.length + 1}`),
+      name: String(item.name || ''),
+      type: declared || (isEvalList ? 'eval' : 'readonly'),
+      // `command` cases carry an executable command (huawei/api test-vars.json);
+      // `prompt` cases carry a task + expected_output (generic evals/evals.json).
+      shape: isEvalList ? 'prompt' : 'command',
+      command: String(item.command || ''),
+      prompt: String(item.prompt || ''),
+      expected: String(item.expected || item.expected_output || ''),
+      files: Array.isArray(item.files) ? item.files.map(String) : [],
+      assertions: Array.isArray(item.assertions) ? item.assertions.map(String) : [],
+      executor: String(item.executor || ''),
+      source: rel,
+      fixture: true,
+    });
+  }
+  return cases;
+}
+
+/**
+ * The evaluated skill's OWN test fixture, per kind (see FIXTURE_PATHS). Returns
+ * `{kind, paths, path, present, error, cases}` — never throws, and an absent/unparseable
+ * fixture is reported as `present: false` (which fails gate `fixtures` and, on its own,
+ * forbids the functional points).
+ */
+export function collectFixtureCases(dir, kind, { readonlyOnly = true, limit = 20 } = {}) {
+  const paths = FIXTURE_PATHS[kind] || FIXTURE_PATHS.huawei;
+  const out = { kind, paths, path: null, present: false, error: '', cases: [] };
+  for (const rel of paths) {
+    const file = path.join(dir || '', rel);
+    if (!dir || !fs.existsSync(file)) continue;
+    let parsed;
+    try { parsed = JSON.parse(fs.readFileSync(file, 'utf8')); }
+    catch (error) { out.error = `${rel} 无法解析：${(error && error.message) || error}`; continue; }
+    const cases = fixtureCasesFrom(parsed, rel, { readonlyOnly, limit });
+    if (!cases.length) { out.error = out.error || `${rel} 中没有可用用例`; continue; }
+    out.path = rel;
+    out.present = true;
+    out.cases = cases;
+    out.error = '';
+    break;
+  }
+  return out;
+}
+
+/**
+ * B: the 3 「功能可用」 points are decided by EXTERNAL evidence, not by the evaluation
+ * agent's own test cases (it writes them after seeing the skill work, so they passed by
+ * construction — 12/13, 13/13, 17/17 in three live runs). All of the following must hold:
+ *   1. ≥ `minFixtureCases` cases **from the skill's own fixture** were actually EXECUTED
+ *      (status pass|fail — `skipped` is not execution; the callers mark self-written cases
+ *      with `fixture: false`, and they can never supply these points);
+ *   2. every executed fixture case carries evidence (command/prompt + observed result +
+ *      comparison against the expectation, which the prompt demands per case);
+ *   3. nothing failed — a `fail` anywhere (fixture or supplementary) is a functional failure.
+ */
+export function assessFunctionalEvidence({ cases = [], fixture = null, minFixtureCases = DEFAULT_EVAL_LIMITS.minFixtureCases } = {}) {
+  const all = (Array.isArray(cases) ? cases : []).filter((item) => item && typeof item === 'object');
+  const fromFixture = all.filter((item) => item.fixture === true);
+  const executed = fromFixture.filter((item) => item.status === 'pass' || item.status === 'fail');
+  const hasEvidence = (item) => Boolean(String(item.command || item.prompt || '').trim()) && Boolean(String(item.evidence || '').trim());
+  const withoutEvidence = executed.filter((item) => !hasEvidence(item));
+  const failed = all.filter((item) => item.status === 'fail');
+  const min = Math.max(1, Number(minFixtureCases) || DEFAULT_EVAL_LIMITS.minFixtureCases);
+  const selfAuthored = all.length - fromFixture.length;
+  const fixtureList = (fixture && Array.isArray(fixture.paths) ? fixture.paths : []).join(' / ') || '（无清单）';
+
+  let usable = false;
+  let evidence = '';
+  if (!fixture || fixture.present !== true) {
+    evidence = `仅自编用例，无 skill 夹具证据：未找到可解析的 ${(fixture && fixture.kind) || ''} 夹具 ${fixtureList}`
+      + `${fixture && fixture.error ? `（${fixture.error}）` : ''} → 功能可用 = 0；自编用例只能作为补充，不能单独支撑这 3 分`;
+  } else if (executed.length < min) {
+    const total = Array.isArray(fixture.cases) ? fixture.cases.length : 0;
+    evidence = `夹具 ${fixture.path} 中的用例实际执行 ${executed.length} 条 < 下限 ${min} 条`
+      + `（夹具共 ${total} 条，评测 agent 报告 fixture 用例 ${fromFixture.length} 条；skipped 不计入"已执行"）`
+      + `→ 功能性证据不足，功能可用 = 0`;
+  } else if (withoutEvidence.length) {
+    evidence = `夹具用例 ${withoutEvidence.map((item) => item.id).join('、')} 缺少证据（需执行命令 + 观测结果 + 与期望的对比结论）→ 功能可用 = 0`;
+  } else if (failed.length) {
+    evidence = `存在 fail 用例：${failed.map((item) => item.id).join('、')}（夹具证据 ${executed.length}/${fromFixture.length} 条已执行）→ 功能可用 = 0`;
+  } else {
+    usable = true;
+    evidence = `skill 夹具 ${fixture.path}：${executed.length}/${fromFixture.length} 条用例已执行且带证据，无 fail`
+      + (selfAuthored > 0 ? `（另有 ${selfAuthored} 条评测 agent 自编补充用例，不作为达标依据）` : '');
+  }
+  return {
+    usable, evidence,
+    fixturePath: (fixture && fixture.path) || null,
+    fixtureCases: fromFixture.length,
+    fixtureExecuted: executed.length,
+    selfAuthored,
+  };
+}
+
+/**
+ * E: local, deterministic gates — no agent involved, either they pass or the score is capped.
+ *
+ *   skill-md         SKILL.md exists and its frontmatter parses with name + description
+ *   fixtures         the kind's own test fixture exists and parses with ≥1 case
+ *   structure        `validateSkillPackage` reports 0 error-level issues (the field is
+ *                    `level`, NOT `severity`), scoped to the rules that apply to the kind
+ *   creator-validate huawei only: the creator's `scripts/validate-skill.sh` runs with no FAIL
+ *                    (unrunnable → recorded as a warning, not a gate)
+ *
+ * `runValidator` is injected so the script execution stays out of the pure logic (and out of
+ * the unit tests): it receives `{ script, skillDir, creatorDir }` and returns
+ * `{ ran, ok, detail }`; `ran: false` means "could not execute" → warning.
+ */
+export function evaluateGates({
+  kind = 'huawei', files = {}, fixture = null, structural = null, skillDir = '',
+  creatorDir = '', strictStructure = false, runValidator = null,
+} = {}) {
+  const gates = [];
+
+  // 1 · SKILL.md + frontmatter
+  const skillEntry = Object.entries(files).find(([rel]) => /(^|\/)SKILL\.md$/.test(rel));
+  const fm = skillEntry ? parseFrontmatterLenient(String(skillEntry[1] || '')) : { ok: false, data: {}, error: 'SKILL.md 不存在' };
+  const name = String(((fm.data || {}).name) || '').trim();
+  const description = String(((fm.data || {}).description) || '').trim();
+  const skillOk = Boolean(skillEntry) && fm.ok === true && Boolean(name) && Boolean(description);
+  gates.push({
+    id: 'skill-md', ok: skillOk,
+    detail: skillOk
+      ? `SKILL.md frontmatter 可解析（name=${name}，description ${description.length} 字符）`
+      : `SKILL.md / frontmatter 不合规：${!skillEntry ? 'SKILL.md 缺失' : fm.ok !== true ? `YAML 无法解析（${fm.error}）` : !name ? 'frontmatter 缺 name' : 'frontmatter 缺 description'}`,
+  });
+
+  // 2 · the kind's own test fixture
+  const fixtureOk = Boolean(fixture && fixture.present === true && Array.isArray(fixture.cases) && fixture.cases.length);
+  gates.push({
+    id: 'fixtures', ok: fixtureOk,
+    detail: fixtureOk
+      ? `${kind} 夹具 ${fixture.path} 可解析（${fixture.cases.length} 条只读用例）`
+      : `未找到可解析的 ${kind} 夹具：${(fixture && Array.isArray(fixture.paths) ? fixture.paths : (FIXTURE_PATHS[kind] || [])).join(' / ')}`
+        + `${fixture && fixture.error ? `（${fixture.error}）` : ''}`,
+  });
+
+  // 3 · structure: error-level issues only (`level`, not `severity`), scoped per kind
+  const issues = structural && Array.isArray(structural.issues) ? structural.issues : [];
+  const errors = issues.filter((issue) => issue && issue.level === 'error');
+  const exempt = new Set(strictStructure || kind === 'huawei' ? [] : NON_HUAWEI_EXEMPT_ERROR_IDS);
+  const counted = errors.filter((issue) => !exempt.has(issue.id));
+  // Top-level entries are re-checked against what THIS kind's creator may write: the Huawei
+  // rule set does not know `requirements.txt` (api) or `evals/` (generic), and flagging them
+  // would fail every non-Huawei skill forever.
+  const allowedTop = new Set(KIND_ALLOWED_TOP[kind] || KIND_ALLOWED_TOP.huawei);
+  const badTop = [...new Set(Object.keys(files || {}).map((rel) => String(rel).split('/')[0]))]
+    .filter((top) => !allowedTop.has(top));
+  const structureOk = !(structural && structural.error) && counted.length === 0 && badTop.length === 0;
+  const structureParts = [];
+  if (counted.length) structureParts.push(`validateSkillPackage error ${counted.length} 项：${counted.slice(0, 4).map((issue) => issue.id).join('、')}`);
+  if (badTop.length) structureParts.push(`不允许的顶层条目 ${badTop.join('、')}（${kind} 允许 ${[...allowedTop].join(' / ')}）`);
+  if (structural && structural.error) structureParts.push(`结构校验异常：${structural.error}`);
+  gates.push({
+    id: 'structure', ok: structureOk,
+    detail: structureOk
+      ? `validateSkillPackage error 0 项${errors.length - counted.length > 0 ? `（另 ${errors.length - counted.length} 项为其它 kind 不适用规则，仅记录）` : ''}`
+      : structureParts.join('；') || '结构校验未通过',
+  });
+
+  // 4 · huawei only: the creator's own validate-skill.sh must not report FAIL
+  if (kind === 'huawei') {
+    const script = path.join(creatorDir || '', 'scripts', 'validate-skill.sh');
+    const present = Boolean(creatorDir) && fs.existsSync(script);
+    if (!present) {
+      gates.push({ id: 'creator-validate', ok: true, enforced: false, detail: 'warning: creator 未提供 scripts/validate-skill.sh，跳过（不作为门禁）' });
+    } else if (typeof runValidator !== 'function') {
+      gates.push({ id: 'creator-validate', ok: true, enforced: false, detail: 'warning: 本次运行没有可用的 bash 执行通道（或未注入），跳过 creator validate-skill.sh（不作为门禁）' });
+    } else {
+      let verdict = { ran: false, detail: '未返回结果' };
+      try { verdict = runValidator({ script, skillDir, creatorDir }) || verdict; }
+      catch (error) { verdict = { ran: false, detail: `执行失败：${(error && error.message) || error}` }; }
+      if (verdict.ran !== true) {
+        gates.push({ id: 'creator-validate', ok: true, enforced: false, detail: `warning: ${verdict.detail || 'creator 校验脚本无法执行'}（不作为门禁）` });
+      } else {
+        gates.push({
+          id: 'creator-validate', ok: verdict.ok !== false, enforced: true,
+          detail: verdict.detail || (verdict.ok === false ? 'creator validate-skill.sh 报 FAIL' : 'creator validate-skill.sh 无 FAIL'),
+        });
+      }
+    }
+  }
+
+  return gates;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Evaluation agent: prompt, output contract, parser, fix prompt, report
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const EVAL_RESULT_OPEN = '<!-- eval-result -->';
 export const EVAL_RESULT_CLOSE = '<!-- /eval-result -->';
 
-/** Prompt for the evaluation agent. Read-only by construction: write cases are excluded. */
-export function buildEvaluationPrompt({ kind, skillName, skillPath, cases = [], readonlyOnly = true, creatorDir = '' } = {}) {
+/**
+ * Prompt for the evaluation agent. Read-only by construction, and — since the agent's own
+ * cases always passed (it writes them after seeing the skill work) — it must lead with the
+ * skill's OWN fixture: those cases are the only admissible evidence for the 3 functional
+ * points (see `assessFunctionalEvidence`).
+ */
+export function buildEvaluationPrompt({
+  kind, skillName, skillPath, cases = [], readonlyOnly = true, creatorDir = '',
+  fixture = null, minFixtureCases = DEFAULT_EVAL_LIMITS.minFixtureCases,
+} = {}) {
+  const list = fixture && Array.isArray(fixture.cases) && fixture.cases.length ? fixture.cases : (Array.isArray(cases) ? cases : []);
+  const fixturePath = (fixture && fixture.path) || (list.length ? (list[0].source || '') : '');
+  const min = Math.max(1, Number(minFixtureCases) || DEFAULT_EVAL_LIMITS.minFixtureCases);
   const lines = [
     `你是「技能评测员」。评测对象是一个刚生成的 ${kind === 'huawei' ? '华为云' : kind === 'api' ? 'REST API' : '通用'} skill，目录：\`${skillPath}\``,
     '',
     '要求：',
     '1. 只做评测，**绝对不要修改被评测 skill 的任何文件**（发现问题只记录，不修复）。',
-    `2. 读该 skill 的 \`SKILL.md\`，按它自己的说明**真实执行**下面列出的用例${readonlyOnly ? '（只跑只读/语法用例，禁止执行任何写操作）' : ''}。`,
-    '3. 每条用例记录：命令、退出码、关键输出（截断到 300 字符）、结论。',
-    '4. 命令不存在或环境缺失（缺 CLI / 缺凭据）时，结论记为 `skipped` 并写明原因；不要把"环境缺失"当成"功能失败"。',
-    '',
+    '2. **必须优先执行该 skill 自带的测试夹具**——这是「功能可用」的唯一达标依据：',
   ];
-  if (cases.length) {
-    lines.push(`只读/语法用例（共 ${cases.length} 条）：`);
-    for (const item of cases) lines.push(`- [${item.type || 'readonly'}] ${item.id || ''} ${item.command || item.name || ''}`);
+  if (list.length) {
+    lines.push(`   夹具文件：\`${fixturePath || '(skill 自带夹具)'}\`，共 ${list.length} 条可用用例（只读/语法；写操作已剔除）：`);
+    for (const item of list) {
+      const id = item.id || '';
+      const source = item.shape === 'prompt' ? 'prompt' : (item.type || 'readonly');
+      if (item.shape === 'prompt') {
+        lines.push(`   - [${source}] ${id} 任务：${String(item.prompt || item.name || '').slice(0, 300)}`);
+        if (item.expected) lines.push(`     期望：${String(item.expected).slice(0, 300)}`);
+        if (item.files && item.files.length) lines.push(`     输入文件：${item.files.join('、')}`);
+        if (item.assertions && item.assertions.length) lines.push(`     断言：${item.assertions.join('；').slice(0, 300)}`);
+      } else {
+        lines.push(`   - [${source}] ${id} ${item.command || item.name || ''}`);
+        if (item.expected) lines.push(`     期望：${String(item.expected).slice(0, 300)}`);
+      }
+    }
+    lines.push(`   至少真实执行其中 ${min} 条（skipped 不算已执行）；夹具用例不足 ${min} 条或缺少证据 → \`functionalUsable\` 必须为 false。`);
   } else {
-    lines.push('没有找到 `templates/test-vars.json` 的只读用例：自行从 `SKILL.md` 的「Core Commands / 真实命令区」挑选**只读**命令执行（只读：List/Show/Get/Describe/查询类，语法检查用 `bash -n`）。');
+    lines.push(`   **没有找到该 skill 自带的夹具**（按 kind 的清单查找${fixture && Array.isArray(fixture.paths) ? `：${fixture.paths.join(' / ')}` : ''}${fixture && fixture.error ? `，原因：${fixture.error}` : ''}）：`,
+      '   请如实把 `functionalUsable` 记为 false，并在 `notes` 里写明"无 skill 夹具证据"。');
   }
   lines.push(
+    '3. 每条夹具用例记录证据：**执行命令** + **观测结果**（退出码 / 关键输出片段，截断到 300 字符）+ **与期望的对比结论**。',
+    `4. ${readonlyOnly ? '只跑只读/语法用例，禁止执行任何写操作' : '按需执行用例'}（只读：List/Show/Get/Describe/查询类；语法检查用 \`bash -n\`）。`,
+    '5. 命令不存在或环境缺失（缺 CLI / 缺凭据）时，结论记为 `skipped` 并写明原因；**skipped 不计入"已执行"**，也不要把"环境缺失"当成"功能失败"。',
+    `6. 夹具用例存在 \`fail\` → \`functionalUsable\` = false（没有例外）。`,
+    '7. 你**自己补充**的用例只能作为补充：标记 `"fixture": false`，**不能单独支撑「功能可用」这 3 分**；没有夹具证据时请如实记 false，不要用自编用例凑达标。',
     '',
     '另外评估「触发词充足度」：SKILL.md 的 frontmatter description 里列出的触发词数量，按 `min(1, 触发词数/4)` 给出 0~1 的比例。',
     '',
     '完成后，输出**恰好一个** JSON 对象，放在下面的标记之间（不要有多余文字）：',
     EVAL_RESULT_OPEN,
-    '{"functionalUsable":true,"triggerSufficiency":1.0,"cases":[{"id":"TC-01","command":"...","status":"pass|fail|skipped","evidence":"..."}],"notes":"..."}',
+    '{"functionalUsable":true,"triggerSufficiency":1.0,"cases":[{"id":"TC-01","fixture":true,"command":"...","status":"pass|fail|skipped","evidence":"命令 + 退出码/输出片段 + 与期望的对比结论"}],"notes":"..."}',
     EVAL_RESULT_CLOSE,
-    '`functionalUsable` = 只读/语法用例中没有任何 fail（skipped 不算 fail）。',
+    '`fixture` = 该用例是否来自 skill 自带夹具（自编用例写 false）；`functionalUsable` = 夹具用例实际执行 ≥' + `${min} 条、每条都有证据、且没有任何 fail。`,
   );
   if (creatorDir) lines.push('', `（参考：该 skill 的生成者是 \`${creatorDir}\`，评测时不需要它。）`);
   return lines.join('\n');
@@ -399,6 +790,9 @@ export function parseEvaluationOutput(text) {
       const cases = Array.isArray(parsed.cases) ? parsed.cases.map((item) => ({
         id: String(item?.id ?? ''),
         command: String(item?.command ?? ''),
+        // The prompt asks for `fixture: true` on cases taken from the skill's own fixture;
+        // only those can carry the 3 functional points (see assessFunctionalEvidence).
+        fixture: item?.fixture === true || item?.source === 'fixture',
         status: ['pass', 'fail', 'skipped'].includes(item?.status) ? item.status : 'skipped',
         evidence: String(item?.evidence ?? '').slice(0, 400),
       })) : [];
@@ -424,6 +818,12 @@ export function buildFixPrompt({ evaluation, round = 1, maxRounds = DEFAULT_MAX_
   ];
   for (const item of evaluation?.deductions || []) lines.push(`- ${item.item}（-${item.points}）：${item.reason}`);
   if (!(evaluation?.deductions || []).length) lines.push('- （无明细）请对照评分口径自查：功能可用 / 触发词充足度 / 成本 / 效率 / 安全');
+  const failedGates = (evaluation?.gates || []).filter((gate) => gate && gate.ok === false);
+  if (failedGates.length) {
+    lines.push('', `**本地门禁未通过（总分已被压到 ${evaluation?.limits ? evaluation.limits.gateScoreCap : DEFAULT_EVAL_LIMITS.gateScoreCap} 上限，必须先修）**：`);
+    for (const gate of failedGates) lines.push(`- ${gate.id}：${gate.detail}`);
+    lines.push('门禁是本地确定性检查（不依赖评测 agent）：SKILL.md 与 frontmatter、该 kind 自带的测试夹具、结构校验 error、华为云 creator 的 validate-skill.sh。');
+  }
   lines.push(
     '',
     '各维度得分：',
@@ -433,16 +833,17 @@ export function buildFixPrompt({ evaluation, round = 1, maxRounds = DEFAULT_MAX_
     `- 安全 ${Number(evaluation?.dimensions?.security ?? 0).toFixed(2)}/3`,
     '',
     '修改要点（按扣分项对应处理）：',
-    '- 功能可用失分：确保 SKILL.md 里的只读命令**真实可执行**（必要时修参数/区域/服务名），并保留可验证的证据。',
+    '- 功能可用失分：**补齐并保留该 kind 自带的测试夹具**（华为云/标准API：`templates/test-vars.json` 的 `test_cases`；通用：`evals/evals.json` 的 `evals`），确保其中 ≥3 条只读/语法用例真实可执行、每条都能给出命令与观测结果。缺少夹具、夹具用例不足或没有证据都会直接 0 分。',
     '- 触发词不足：在 frontmatter description 里补足触发短语（建议 ≥4 条，中英文各覆盖）。',
-    '- 成本/效率失分：减少不必要的反复探测、合并重复命令、不要重复调用同一工具。',
+    '- 成本/效率失分：对照绝对上限（token/时长/工具与 LLM 调用次数）与首轮基线，减少不必要的反复探测、合并重复命令、不要重复调用同一工具；工具失败与重试必须为 0。',
     '- 安全失分：移除任何硬编码凭据；写操作必须在 SKILL.md 中要求人工确认；不要直接调用其它 skill。',
+    '- 门禁失分：按上面每条 gate 的说明修（frontmatter 补 name/description、补齐夹具文件、修结构校验 error、清理不该留在技能包里的临时文件）。',
   );
   return lines.join('\n');
 }
 
 /** The run's human-readable evaluation report (persisted on the run, shown in the panel). */
-export function formatEvaluationReport({ run = {}, evaluations = [], passScore = DEFAULT_PASS_SCORE, maxRounds = DEFAULT_MAX_EVAL_ROUNDS } = {}) {
+export function formatEvaluationReport({ run = {}, evaluations = [], passScore = DEFAULT_PASS_SCORE, maxRounds = DEFAULT_MAX_EVAL_ROUNDS, gateScoreCap = null } = {}) {
   const last = evaluations[evaluations.length - 1];
   const lines = [
     `# 技能评测报告`,
@@ -466,6 +867,15 @@ export function formatEvaluationReport({ run = {}, evaluations = [], passScore =
     if ((last.deductions || []).length) {
       lines.push('', '## 扣分明细');
       for (const item of last.deductions) lines.push(`- ${item.item}（-${item.points}）：${item.reason}`);
+    }
+  }
+  // The local gates are what make a below-8.5 verdict deterministic: list them every round.
+  const lastGates = (last && Array.isArray(last.gates)) ? last.gates : [];
+  if (lastGates.length) {
+    const gateCap = Number.isFinite(Number(gateScoreCap)) ? Number(gateScoreCap) : DEFAULT_EVAL_LIMITS.gateScoreCap;
+    lines.push('', `## 本地门禁（任一不过 → 总分上限 ${gateCap}）`, '| 门禁 | 结论 | 明细 |', '| --- | --- | --- |');
+    for (const gate of lastGates) {
+      lines.push(`| ${gate.id} | ${gate.ok === false ? '❌ 未通过' : gate.enforced === false ? '⚠️ 跳过（warning）' : '✅ 通过'} | ${String(gate.detail || '').replace(/\|/g, '/')} |`);
     }
   }
   lines.push('', '## 未纳入（平台侧信号缺失）');
@@ -504,22 +914,21 @@ export function readSkillFiles(dir, { maxFiles = MAX_FILES, maxBytes = MAX_BYTES
   return out;
 }
 
-/** The only cases this evaluator is allowed to run: readonly + syntax. */
+/**
+ * The only cases this evaluator is allowed to run: readonly + syntax.
+ *
+ * Thin wrapper over `collectFixtureCases` (kind `huawei`, whose path list covers both
+ * `templates/test-vars.json` and `templates/test-defaults.json`) kept for callers/tests that
+ * only want the executable command cases.
+ */
 export function readReadonlyCases(dir, { readonlyOnly = true, limit = 20 } = {}) {
-  for (const rel of ['templates/test-vars.json', 'templates/test-defaults.json']) {
-    const file = path.join(dir || '', rel);
-    if (!dir || !fs.existsSync(file)) continue;
-    try {
-      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-      const cases = Array.isArray(parsed.test_cases) ? parsed.test_cases : [];
-      const wanted = readonlyOnly ? cases.filter((item) => ['readonly', 'syntax'].includes(String(item.type || '').toLowerCase())) : cases;
-      return wanted.slice(0, limit).map((item) => ({
-        id: String(item.id || ''), name: String(item.name || ''), command: String(item.command || ''),
-        expected: String(item.expected || ''), type: String(item.type || 'readonly'), executor: String(item.executor || 'cli'),
-      }));
-    } catch { /* fall through to the next candidate */ }
-  }
-  return [];
+  const fixture = collectFixtureCases(dir, 'huawei', { readonlyOnly, limit });
+  return fixture.cases
+    .filter((item) => item.shape === 'command')
+    .map((item) => ({
+      id: item.id, name: item.name, command: item.command, expected: item.expected,
+      type: item.type, executor: item.executor,
+    }));
 }
 
 /** Frontmatter description of a `{ relPath: text }` map (for the local trigger fallback). */
